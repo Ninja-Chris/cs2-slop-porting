@@ -128,7 +128,8 @@ STEAM_HEATWAVE_MODE = "refract"        # env_steam type 1 (heat wave) is a disto
 STEAM_HEATWAVE_TEXTURE = ""                # "" = generate a soft noisy normal map (default; raise STEAM_HEATWAVE_NORMAL_STRENGTH for a stronger ripple). Alternatives: "source1vmt:sprites/heatwave" = the real Source1 heat-wave material: converts its $normalmap (effects/fisheyelens_normal) as a proper normal map (needs that vtf + the vmt under SOURCE1_ROOTS); "source1:particle/particle_smokegrenade" = convert that Source1 texture and refract with it; "materials/particle/warp5_explosion.vtex" = stock CS2 shockwave texture (draws a dark ring); or any stock CS2 .vtex path (see the heat-wave candidates log)
 STEAM_HEATWAVE_SPIN = 120.0              # heat-wave sprites: spin speed range (+- degrees/second). Source1 gives each heat-wave quad a randomly tilted normal every frame (a flutter) instead of rolling it; spinning the lens normal map is the closest CS2 equivalent. 0 = no flutter
 STEAM_HEATWAVE_NORMAL_STRENGTH = 3.0      # strength of the generated normal map (bigger = stronger ripple)
-STEAM_HEATWAVE_REFRACT = None          # refract amount. None = the $refractamount of the Source1 material when STEAM_HEATWAVE_TEXTURE is "source1vmt:..." (the heat-wave material says -0.007, which gives the invisible distortion the original has), otherwise 0.25 (what the stock reference particle uses). A number overrides both
+STEAM_HEATWAVE_REFRACT = None          # refract amount. None = match Source1: the $refractamount of sprites/heatwave.vmt (-0.007 in CSGO, which gives the near-invisible distortion the original has), read whatever STEAM_HEATWAVE_TEXTURE is; if that .vmt is not found STEAM_HEATWAVE_SOURCE_REFRACT is used. A number overrides it (0.25 = what the stock CS2 reference particle uses)
+STEAM_HEATWAVE_SOURCE_REFRACT = -0.007  # the stock CSGO sprites/heatwave.vmt $refractamount, used when the .vmt cannot be read
 STEAM_FORWARD_AXIS = "x"               # which local axis of the info_particle_system the jet fires along: x (Source1 forward), -x, y, -y, z, -z. Change it if the steam points the wrong way
 STEAM_EMIT_AXIS = "x"                  # local axis the jet travels along in the particle: "x" (forward, as in Source1), "y" or "z" (up). Change it if the steam leaves in the wrong direction even though the entity angles match
 STEAM_ALPHA_SCALE = 1.0                # multiplies renderamt (clamped to 255); raise it (e.g. 1.5-2) if the steam is still less white/dense than Source1
@@ -2603,6 +2604,24 @@ def make_steam_particle(export_dir: Path, name: str, kv: dict):
     end_scale = max(size1, 1.0) / max(size0, 1.0)
 
     refract_amt = 0.25 if STEAM_HEATWAVE_REFRACT is None else float(STEAM_HEATWAVE_REFRACT)
+    refract_note = ""
+    if refract and STEAM_HEATWAVE_REFRACT is None:
+        # Source1 keeps the heat-wave distortion in the MATERIAL ($refractamount of sprites/heatwave.vmt, which env_steam type 1 always draws), not on the entity or the particle
+        _hm = STEAM_HEATWAVE_TEXTURE[11:].strip().replace("\\", "/") if STEAM_HEATWAVE_TEXTURE.lower().startswith("source1vmt:") else "sprites/heatwave"
+        _hv = None
+        try:
+            _hp, _hr = find_in_source1("materials/" + _hm + ".vmt")
+            if _hp:
+                _m = re.search(r'"?\$refractamount"?\s+"?(-?[0-9]*\.?[0-9]+)', parse_vmt(Path(_hp)).get("text", ""), flags=re.I)
+                if _m:
+                    _hv = float(_m.group(1))
+        except Exception:
+            _hv = None
+        if _hv is None:
+            _hv, refract_note = STEAM_HEATWAVE_SOURCE_REFRACT, f"; refract amount {STEAM_HEATWAVE_SOURCE_REFRACT:g} (the stock Source1 {_hm} value: the .vmt was not found under SOURCE1_ROOTS)"
+        else:
+            refract_note = f"; refract amount {_hv:g} taken from Source1 material {_hm}"
+        refract_amt = _hv
     if refract:
         if STEAM_HEATWAVE_TEXTURE.lower().startswith("source1vmt:"):
             _vref = STEAM_HEATWAVE_TEXTURE[11:].strip().replace("\\", "/")
@@ -2617,10 +2636,6 @@ def make_steam_particle(export_dir: Path, name: str, kv: dict):
                 vtex_rel = os.path.splitext(_crel)[0] + "_heatnormal.vtex"
                 write_simple_vtex(export_dir / vtex_rel, _crel, "DXT5", linear=True)
                 tex_note = f"refraction using the normal map of Source1 material {_vref} ({_vd['normalmap']}) -> {vtex_rel}"
-                _ra = re.search(r'"?\$refractamount"?\s+"?(-?[0-9.]+)', _vd.get("text", ""), flags=re.I)
-                if _ra and STEAM_HEATWAVE_REFRACT is None:
-                    refract_amt = float(_ra.group(1))
-                    tex_note += f"; refract amount {refract_amt:g} taken from the material"
             except Exception as _ex:
                 vtex_rel = make_heatwave_normal(export_dir)
                 tex_note = f"Source1 material {_vref} unavailable ({_ex}); fell back to the generated soft normal map ({vtex_rel})"
@@ -2735,7 +2750,7 @@ def make_steam_particle(export_dir: Path, name: str, kv: dict):
              f"lifetime={life:.3f}s speed={speed:g} spread={spread:g} rate={rate:g}/s max_particles={max_p} "
              f"size {size0:g}->{size1:g} (radius {start_r:.1f} x{end_scale:.2f}) roll=+-{roll:g} "
              f"colour {r} {g} {b} ({'emissive' if emissive else 'lit in Source1; STEAM_UNLIT_TINT here'}) alpha<={alpha}\t"
-             f"texture: {tex_note}"]
+             f"texture: {tex_note}{refract_note if refract else ''}"]
     if heat:
         lines.append(f"{name}\tNOTE: env_steam type 1 is the heat-wave (distortion) variant; built as "
                      + ("a refracting sprite (no visible steam)" if refract else "visible soft sprites, not a distortion"))
@@ -5460,7 +5475,7 @@ def find_asset(asset_rel_path: str):
 
 # ======================================================================== MAIN
 
-SCRIPT_VERSION = "2026-10-29g 2.8 8-bit wav fallback"
+SCRIPT_VERSION = "2026-10-29h 2.8 heat-wave refract from Source1"
 
 def main():
     global EXPORT_DIR
