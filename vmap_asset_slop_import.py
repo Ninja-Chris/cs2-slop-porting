@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vmap_asset_slop_import.py
+# vmap_convert_merged.py
 #
 # Source1 -> CS2 map port helper. Run it on the .vmap(s) Valve's importer produced (VMAP_PATH). One pass does three things:
 #
@@ -15,8 +15,9 @@
 #      CS2 vmats that ship as stubs (error shader, no textures) are re-ported from Source1 (<prefix>_cs2_stub_materials.txt).
 #   2. Otherwise converted / copied from the Source1 roots (map folder first, then the stock roots):
 #        .vmat/.vmt   -> VMT parsed (patch/include/insert/replace) and written as VMAT, textures decoded from VTF to
-#                        .tga / .png atlas. Additive: lightmapped = F_TRANSLUCENT + F_ADDITIVE_BLEND, others move to
-#                        csgo_unlitgeneric (F_BLEND_MODE 4). Alpha test and translucent are exclusive on lit shaders.
+#                        .tga / .png atlas. Additive: moved to csgo_unlitgeneric (F_BLEND_MODE 4);
+#                        LIT_ADDITIVE_VIA_TRANSLUCENT keeps lightmapped ones lit (F_TRANSLUCENT + F_ADDITIVE_BLEND, not reliable). Alpha test and translucent are exclusive on lit shaders.
+#                        $ssbump bump maps are converted to real normal maps;
 #                        $nocull -> F_RENDER_BACKFACES; translucent / alpha-tested materials get a _trans.tga alpha mask
 #        .tga/.png/.jpg raw images -> copied
 #        .vsnd / .wav / .mp3 -> the Source1 sound is copied to sounds/ (CS2 compiles it); non-PCM wavs and looping mp3
@@ -31,9 +32,15 @@
 #    both need the decompiled Source1 .vmf, auto-found under <Source1 root>/maps or set via STATIC_OVERLAY_VMF)
 #   - static overlays (decals): the importer writes a tiny placeholder quad; rebuilt to the Source1 texture size x $decalscale,
 #     laid on the surface found in the .vmf (origin, angles, mirrored UVs). <prefix>_static_overlay_fix.txt
+#   - static overlays that sit on brush ENTITIES (CS2 overlays do not project onto entities): replaced by a translucent quad parented to the
+#     entity (<name>.vmap.before_overlayquads, <prefix>_overlay_entity_quads.txt; OVERLAY_ENTITY_QUADS)
+#   - <prefix>_dropped_io.txt (REPORT_DROPPED_IO): entity outputs in the .vmf that are not in the .vmap, with whether their target still exists. Report only.
 #   - brush face texture mapping: the importer reduces shifts to 0..16 and (without the textures) mangles scales; the original
 #     axes / scale / shift are copied back from the matching .vmf brush side and the face texture coordinates are rewritten
-#     from the Source1 texture size. <prefix>_face_scale_fix.txt (faces it could not match are left as imported)
+#     from the Source1 texture size. Faces on a displacement take the displacement's base-face mapping; geometry that is a copy of a .vmf brush
+#     moved elsewhere in Hammer is recognised by its size and takes that brush's mapping, shift corrected for the move (texture lock).
+#     <prefix>_absurd_scales.txt lists every face whose scale is still out of range and what the .vmf says about its material.
+#     <prefix>_face_scale_fix.txt (faces it could not match are left as imported)
 #
 # C. EXTRAS
 #   - soundevents/soundevents_addon.vsndevts: one event per converted sound (named like the path, e.g. mysounds.mh_blade_loop1;
@@ -92,11 +99,15 @@ STATIC_OVERLAY_PATCH_IN_PLACE = True   # True: patch the overlays inside the vma
 STATIC_OVERLAY_ONLY_PLACEHOLDERS = True   # patching only touches overlays that are still the importer's untouched 2x2 quad (angles 0, scale 1). Any overlay you changed by hand (even just the scale) is skipped. False: patch every overlay that differs from the .vmf target
 STATIC_OVERLAY_PROJECTION_FAR = None   # e.g. 8.0: every static overlay's projection depth is set to this (also on overlays that are already patched / hand-edited; the importer sometimes writes 64, which shows as a 2x2x64 box and the overlay is not visible). The overlay origin sits NORMAL_OFFSET above the surface, so only far - offset reaches into it. None = leave the depth alone
 FACE_SCALE_FIX = True   # repair brush face texture scale/shift the importer got wrong (it does not read the Source1 textures: scale comes out as 0.25/256 etc.). Needs the .vmf (same auto-find as the overlays); patched in place, original kept in the logs folder as <name>.vmap.before_scalefix
-LIT_ADDITIVE_VIA_TRANSLUCENT = True   # additive materials on csgo_lightmappedgeneric stay there with F_TRANSLUCENT 1 + F_ADDITIVE_BLEND 1 (confirmed from a saved lightmapped vmat: additive only becomes available once translucent is on). False: move them to csgo_unlitgeneric (F_BLEND_MODE 4) as before. Vertexlit materials are always moved to unlit (no confirmed additive flag there). Alpha test and translucent are exclusive on the lit shaders: alpha test wins unless the material is additive
+LIT_ADDITIVE_VIA_TRANSLUCENT = False  # True: additive materials stay on csgo_lightmappedgeneric with F_TRANSLUCENT 1 + F_ADDITIVE_BLEND 1 (the flags exist in a saved lightmapped vmat, but a black additive material such as Goldeneye glass04 then shows as opaque black in Hammer). False (default): move them to csgo_unlitgeneric (F_BLEND_MODE 4, confirmed additive and see-through). Vertexlit materials are always moved to unlit (no confirmed additive flag there). Alpha test and translucent are exclusive on the lit shaders: alpha test wins unless the material is additive
 MISSING_SUGGESTIONS = True   # missing_reasons log: also say what referenced each missing asset and whether a file with the same name exists elsewhere in the Source1 folders / CS2 (one extra scan of the folders when something is missing)
+MATCH_MOVED_LEVELS = False      # True: faces with no .vmf geometry are re-tested at offsets that several materials agree on (a floor/level moved as a whole in Hammer)
 FACE_SCALE_BAD_RATIO = (0.75, 1.5)   # a face counts as broken when vmap scale / .vmf scale is outside this range on either axis (axis normalisation alone gives up to ~1.3)
 STATIC_OVERLAY_TEX_FLIP = "v"          # how the texture is laid on the quad: "" (importer's UVs), "u", "v" or "uv" (mirror the image left-right / up-down / both). Absolute values are written, so reruns do not flip twice
 STATIC_OVERLAY_NORMAL_OFFSET = 4.0     # the importer puts each overlay origin this far above the surface (+4 in Z on the floor decals)
+OVERLAY_ENTITY_QUADS = True   # CS2 static overlays do not project onto brush entities (func_breakable, doors, ...). True: an overlay whose projection reaches a face of exactly one entity (and no world brush face) is replaced by a translucent quad parented to that entity (CMapMesh + <material>_quad.vmat written to the addon), so it shows and moves with it. Patched in place (Hammer must be closed); original kept in the logs folder as <name>.vmap.before_overlayquads. <prefix>_overlay_entity_quads.txt lists every overlay it converted or left, and why. Overlays that also touch world brushes, touch two entities or lie on slanted faces stay overlays
+OVERLAY_QUAD_OFFSET = 0.25    # the quad is laid this far in front of the entity face (toward the viewer), to avoid z-fighting
+REPORT_DROPPED_IO = True      # list the entity outputs (IO) that are in the .vmf but not in the .vmap -> <prefix>_dropped_io.txt. Read-only: nothing is restored or changed. Needs the .vmf
 SOUND_RANGE_MIN = 0.0                  # floor for the curve end distance after scaling (0 = none)
 SOUND_EVERYWHERE_RADIUS = 100000.0
 SOUNDEVENT_PREFIX = ""                 # e.g. 'mymap.' -> 'mymap.mysounds.mh_blade_loop1'
@@ -331,7 +342,7 @@ def split_glued_paths(s: str):
             out.append(chunk)
     return out or [s]
 
-VALID_PATH_CHARS_RE = re.compile(r'^[a-zA-Z0-9_\-./&() ]+$')
+VALID_PATH_CHARS_RE = re.compile(r'^[a-zA-Z0-9_\-./&()+ ]+$')
 
 @lru_cache(maxsize=500_000)
 def is_valid_asset_path(path: str) -> bool:
@@ -370,7 +381,7 @@ def enumerate_vmaps(vmap_path_or_dir: str):
     raise FileNotFoundError(f"VMAP_PATH does not exist or is not a .vmap/dir: {p}")
 
 def copy_asset_to_export(export_dir: Path, source_path: str, relative_path: str) -> bool:
-    dest = export_dir / Path(rel_norm(relative_path))
+    dest = export_dir / Path(rel_norm(relative_path.replace("+", "_")))
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():
         shutil.copy2(source_path, str(dest))
@@ -379,8 +390,8 @@ def copy_asset_to_export(export_dir: Path, source_path: str, relative_path: str)
 
 # ======================================================================== VMAP HARVEST
 
-PAT_BYTES = re.compile(rb'[A-Za-z0-9_\-./\\&() ]{2,}\.[A-Za-z0-9_]{1,8}')
-PAT_ASCII_IN_STR = re.compile(r'[A-Za-z0-9_\-./\\&() ]{2,}\.[A-Za-z0-9_]{1,8}')
+PAT_BYTES = re.compile(rb'[A-Za-z0-9_\-./\\&()+ ]{2,}\.[A-Za-z0-9_]{1,8}')
+PAT_ASCII_IN_STR = re.compile(r'[A-Za-z0-9_\-./\\&()+ ]{2,}\.[A-Za-z0-9_]{1,8}')
 
 def _extract_from_ascii_tokens(data: bytes):
     out = set()
@@ -408,6 +419,29 @@ def _fallback_regex_scan(data: bytes):
             out.add(s)
     return out
 
+_PLUS_REF_RE = re.compile(rb'(materials/[A-Za-z0-9_\-./ ]*/)\+([0-9][A-Za-z0-9_\-. ]*\.(?:vmat|vmt|vtf|tga|png))')
+
+def rename_plus_refs(vmap_paths, backup_dir):
+    """CS:GO animated-texture frames (materials/x/+0name.vmat): resourcecompiler stops with "Non-fused-child compiles cannot contain fused delimiter '+'".
+    The converted files are written with '_' (see _tex_base); the vmap's references are rewritten the same way. Same length, so patched in place
+    (original kept in backup_dir as <name>.before_plusfix). -> list of the renamed references"""
+    done = []
+    for vp in vmap_paths:
+        try:
+            data = Path(vp).read_bytes()
+            hits = sorted({m_.group(0).decode("ascii", "ignore") for m_ in _PLUS_REF_RE.finditer(data)})
+            if not hits:
+                continue
+            bak = os.path.join(backup_dir, os.path.basename(str(vp)) + ".before_plusfix")
+            if not os.path.exists(bak):
+                shutil.copy2(str(vp), bak)
+            Path(vp).write_bytes(_PLUS_REF_RE.sub(lambda m_: m_.group(1) + b"_" + m_.group(2), data))
+            done += hits
+            print(f"  [PLUS] {os.path.basename(str(vp))}: {len(hits)} reference(s) to '+' names renamed to '_' ({'; '.join(hits[:4])}); original saved as {os.path.basename(bak)}")
+        except Exception as ex:
+            print(f"  [WARN] could not rename '+' references in {vp}: {ex}")
+    return done
+
 def extract_assets_from_vmap(path: str):
     data = Path(path).read_bytes()
     candidates = set()
@@ -427,7 +461,7 @@ def extract_assets_from_vmap(path: str):
     return out
 
 EXT_RE = r"(?:vmat|vtex|vtex_c|tga|png|jpg|jpeg|dmx|vmdl|vmdl_c|vsnd|vpcf|wav|mp3|vmt|vtf)"
-PATH_RE_TEXT = re.compile(rf'([A-Za-z0-9_\-./\\&() ]+\.{EXT_RE})', re.IGNORECASE)
+PATH_RE_TEXT = re.compile(rf'([A-Za-z0-9_\-./\\&()+ ]+\.{EXT_RE})', re.IGNORECASE)
 
 @lru_cache(maxsize=200_000)
 def parse_vmat_dependencies(vmat_path: str):
@@ -681,6 +715,7 @@ def parse_vmt(vmt_path: Path):
         "alphatest": is_true("$alphatest"),
         "additive": is_true("$additive"),
         "nocull": is_true("$nocull"),
+        "ssbump": is_true("$ssbump"),
         "selfillum": is_true("$selfillum"),
         "alphatestreference": None,
         "envmapmask": ref("$envmapmask"),
@@ -999,6 +1034,37 @@ def save_static(rgba, w, h, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     Image.frombytes("RGBA", (w, h), rgba).save(out_path)
 
+def ssbump_to_normal_rgba(rgba, w, h):
+    """$ssbump textures are self-shadowing bump maps: R, G, B are the light reaching the surface from the three Source1 radiosity
+    basis directions, not a tangent-space normal (exported as one they average ~(122,123,116) instead of ~(128,128,255) and light
+    wrongly). Rebuild an approximate normal: n = R*b0 + G*b1 + B*b2, normalised, with the Source1 basis (the same y orientation as
+    Source1 normal maps, so legacy_source1_inverted_normal still applies). -> rgba bytes (alpha 255)."""
+    r2, r6, r3 = math.sqrt(2.0 / 3.0), 1.0 / math.sqrt(6.0), 1.0 / math.sqrt(3.0)
+    h2 = 1.0 / math.sqrt(2.0)
+    try:
+        import numpy as np
+        a = np.frombuffer(rgba, dtype=np.uint8).reshape(h, w, 4)[:, :, :3].astype(np.float32) / 255.0
+        bas = np.array([[r2, 0.0, r3], [-r6, h2, r3], [-r6, -h2, r3]], dtype=np.float32)
+        n = a @ bas
+        n /= np.maximum(np.linalg.norm(n, axis=2, keepdims=True), 1e-6)
+        out = np.empty((h, w, 4), dtype=np.uint8)
+        out[:, :, :3] = np.clip((n * 0.5 + 0.5) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        out[:, :, 3] = 255
+        return out.tobytes()
+    except ImportError:
+        pass
+    out = bytearray(w * h * 4)
+    for i in range(w * h):
+        r, g, b = rgba[i * 4] / 255.0, rgba[i * 4 + 1] / 255.0, rgba[i * 4 + 2] / 255.0
+        x, y, z = r * r2 - (g + b) * r6, (g - b) * h2, (r + g + b) * r3
+        ln = math.sqrt(x * x + y * y + z * z) or 1.0
+        o = i * 4
+        out[o] = int((x / ln * 0.5 + 0.5) * 255.0 + 0.5)
+        out[o + 1] = int((y / ln * 0.5 + 0.5) * 255.0 + 0.5)
+        out[o + 2] = int((z / ln * 0.5 + 0.5) * 255.0 + 0.5)
+        out[o + 3] = 255
+    return bytes(out)
+
 def save_png(rgba, w, h, out_path: Path):
     save_static(rgba, w, h, out_path)
 
@@ -1024,9 +1090,10 @@ def _tex_base(ref: str, suffix: str) -> str:
     t = strip_materials_prefix(ref).lower()
     if t.endswith(".vtf"):
         t = t[:-4]
+    # '+' (CS:GO animated-texture frames: +0name) is a "fused delimiter" in resourcecompiler: files are written with '_' instead
     if t.endswith(suffix):
-        return "materials/" + t
-    return "materials/" + t + suffix
+        return ("materials/" + t).replace("+", "_")
+    return ("materials/" + t + suffix).replace("+", "_")
 
 def _load_vtf_first_frame(ref: str):
     vtf = resolve_vtf(ref)
@@ -1086,7 +1153,7 @@ class Cs2Vpk:
     def add_dir_vpk(self, path: str):
         try:
             st = os.stat(path)
-            cache = os.path.join(LOG_DIR, ".vpkcache2_" + re.sub(r"[^A-Za-z0-9]+", "_", path)[-120:] + ".pkl")
+            cache = os.path.join(LOG_DIR, ".vpkcache3_" + re.sub(r"[^A-Za-z0-9]+", "_", path)[-120:] + ".pkl")
             key = (path, st.st_size, int(st.st_mtime))
             try:
                 with open(cache, "rb") as f:
@@ -1156,7 +1223,7 @@ class Cs2Vpk:
                     fp = ((dd + "/") if dd else "") + ("" if name == " " else name) + ("" if ext == " " else "." + ext)
                     fp = fp.replace("\\", "/").lower()
                     files.append(fp)
-                    if fp.startswith(VPK_READ_PREFIXES) or fp.endswith(".vmat_c"):
+                    if fp.startswith(VPK_READ_PREFIXES) or fp.endswith(".vmat_c") or (fp.startswith("materials/") and fp.endswith(".vtex_c")):
                         entries[fp] = (path, arch, (data_start + offset) if arch == 0x7FFF else offset, length, pre)
         return files, entries
 
@@ -1555,6 +1622,8 @@ def convert_one_vmt(export_dir: Path, vmt_abs: str, vmat_rel: str):
             try:
                 nw, nh, nrgba = normal_frame
                 normal_rel = _tex_base(data["normalmap"], "_normal") + ".tga"
+                if data.get("ssbump"):
+                    nrgba = ssbump_to_normal_rgba(nrgba, nw, nh)
                 save_static(nrgba, nw, nh, export_dir / normal_rel)
                 write_texture_settings_txt(export_dir / normal_rel, {"legacy_source1_inverted_normal": "1"})
             except Exception:
@@ -1974,16 +2043,57 @@ def _wav_raw_chunks(path: str, wanted=(b"cue ", b"smpl")):
                 out.append(hdr + body + (b"\0" if size & 1 else b""))
     return out
 
+def _wav_pcm16_pure(src: str, info) -> bytes:
+    """8/24/32-bit integer PCM and 32/64-bit float -> 16-bit PCM bytes, no third-party modules (ADPCM still needs miniaudio)."""
+    import array
+    tag, _ch, _rate, bits = info
+    data = None
+    with open(src, "rb") as f:
+        f.read(12)
+        while True:
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                break
+            cid, size = hdr[:4], struct.unpack("<I", hdr[4:])[0]
+            if cid == b"data":
+                data = f.read(size)
+                break
+            f.seek(size + (size & 1), 1)
+    if data is None:
+        raise ValueError("no data chunk")
+    if tag == 1 and bits == 8:
+        out = array.array("h", [(b - 128) << 8 for b in data])
+    elif tag == 1 and bits == 24:
+        n = len(data) // 3
+        out = array.array("h", [struct.unpack_from("<h", data, 3 * i + 1)[0] for i in range(n)])
+    elif tag == 1 and bits == 32:
+        n = len(data) // 4
+        out = array.array("h", [struct.unpack_from("<h", data, 4 * i + 2)[0] for i in range(n)])
+    elif tag == 3 and bits in (32, 64):
+        fl = array.array("f" if bits == 32 else "d")
+        fl.frombytes(data[: len(data) // (bits // 8) * (bits // 8)])
+        out = array.array("h", [max(-32768, min(32767, int(round(v * 32767.0)))) for v in fl])
+    else:
+        raise ValueError(f"cannot convert tag {tag} / {bits}-bit without miniaudio")
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes()
+
 def wav_to_pcm16(src: str, dst: str, info):
-    import miniaudio, wave
+    import wave
     _tag, ch, rate, _bits = info
-    dec = miniaudio.decode_file(src, output_format=miniaudio.SampleFormat.SIGNED16, nchannels=ch, sample_rate=rate)
+    try:
+        import miniaudio
+        dec = miniaudio.decode_file(src, output_format=miniaudio.SampleFormat.SIGNED16, nchannels=ch, sample_rate=rate)
+        pcm, n_ch, sr = dec.samples.tobytes(), dec.nchannels, dec.sample_rate
+    except ImportError:
+        pcm, n_ch, sr = _wav_pcm16_pure(src, info), ch, rate     # miniaudio not installed: 8/24/32-bit and float still convert
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
     with wave.open(dst, "wb") as w:
-        w.setnchannels(dec.nchannels)
+        w.setnchannels(n_ch)
         w.setsampwidth(2)
-        w.setframerate(dec.sample_rate)
-        w.writeframes(dec.samples.tobytes())
+        w.setframerate(sr)
+        w.writeframes(pcm)
     extra = _wav_raw_chunks(src)
     if extra:
         with open(dst, "r+b") as f:
@@ -2807,6 +2917,34 @@ def _overlay_texture_size(mat: str):
     except Exception:
         return None
 
+_ADDON_DIR = None      # set by main(): the addon folder the converted materials/textures were written to
+
+def _addon_texture_size(mat: str):
+    """Size of the colour texture the converted addon material actually uses (what Hammer draws with) -> (w, h, 1.0) or None."""
+    try:
+        if not _ADDON_DIR:
+            return None
+        base = mat.replace("\\", "/").lower()
+        vm = Path(_ADDON_DIR) / (base if base.endswith(".vmat") else base + ".vmat")
+        if not vm.is_file():
+            return None
+        mm = re.search(r'"(?:TextureColor|TextureLayer1Color)"\s+"([^"]+)"', vm.read_text(errors="ignore"))
+        if not mm:
+            return None
+        tp = Path(_ADDON_DIR) / mm.group(1)
+        if not tp.is_file():
+            return None
+        hdr = tp.read_bytes()[:32]
+        if tp.suffix.lower() == ".tga" and len(hdr) >= 18:
+            w, h = struct.unpack("<HH", hdr[12:16])
+        elif hdr[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = struct.unpack(">II", hdr[16:24])
+        else:
+            return None
+        return (w, h, 1.0) if w > 0 and h > 0 else None
+    except Exception:
+        return None
+
 def static_overlay_report(vmap_paths, export_dir: Path):
     """CMapStaticOverlay elements (Hammer's decals / Source1 infodecal+info_overlay) are not CMapEntity, so the
     entity checks never see them. -> report lines: one per overlay with origin, material, whether the mesh is still the
@@ -3144,6 +3282,7 @@ def _vmf_sides(root):
         for ch in node[2]:
             if ch[0] == "solid":
                 planes, allpts = [], []
+                first = len(out)
                 for sd in ch[2]:
                     if sd[0] != "side":
                         continue
@@ -3157,12 +3296,15 @@ def _vmf_sides(root):
                     try:
                         n = _v_norm(_v_cross(_v_sub(pl[1], pl[0]), _v_sub(pl[2], pl[0])))
                         planes.append((n, _v_dot(n, pl[0])))
-                        out.append(dict(n=n, d=_v_dot(n, pl[0]), solid=planes, mat=k.get("material", "").lower().replace("\\", "/"),
-                                        us=float(ua.group(2)), vs=float(va.group(2)),
+                        out.append(dict(n=n, d=_v_dot(n, pl[0]), solid=planes, mat=k.get("material", "").lower().replace("\\", "/").replace(" ", "_"),
+                                        us=float(ua.group(2)), vs=float(va.group(2)), disp=any(c[0] == "dispinfo" for c in sd[2]),
                                         ua=[float(x) for x in ua.group(1).split()[:4]], va=[float(x) for x in va.group(1).split()[:4]]))
                     except ValueError:
                         pass
                 if allpts:      # make every plane of this brush point outwards, so "inside the brush" can be tested
+                    _bb = ([min(q[j] for q in allpts) for j in range(3)], [max(q[j] for q in allpts) for j in range(3)])
+                    for _sd in out[first:]:
+                        _sd["bb"] = _bb
                     cen = [sum(q[j] for q in allpts) / len(allpts) for j in range(3)]
                     for i, (n_, d_) in enumerate(planes):
                         if _v_dot(n_, cen) - d_ > 0:
@@ -3171,6 +3313,136 @@ def _vmf_sides(root):
                 walk(ch)
     walk(root)
     return out
+
+def _solve3(a, b, c):
+    """intersection point of three planes (n, d) with n.p = d, or None"""
+    cr = _v_cross(b[0], c[0])
+    det = _v_dot(a[0], cr)
+    if abs(det) < 1e-6:
+        return None
+    c31, c12 = _v_cross(c[0], a[0]), _v_cross(a[0], b[0])
+    return [(a[1] * cr[i] + b[1] * c31[i] + c[1] * c12[i]) / det for i in range(3)]
+
+def _solid_index(sides):
+    """.vmf brushes by size: {(dx, dy, dz) rounded to 0.1: [(min corner, [sides of that brush])]}. A copy of a brush that was moved in Hammer keeps its size."""
+    import itertools
+    groups = {}
+    for sd in sides:
+        groups.setdefault(id(sd["solid"]), []).append(sd)
+    out = {}
+    for ss in groups.values():
+        pl = ss[0]["solid"]
+        if len(pl) < 4 or len(pl) > 24:
+            continue
+        vs = []
+        for a, b, c in itertools.combinations(pl, 3):
+            pt = _solve3(a, b, c)
+            if pt and all(_v_dot(n, pt) - d <= 0.05 for n, d in pl):
+                vs.append(pt)
+        if not vs:
+            continue
+        lo = [min(v[k] for v in vs) for k in range(3)]
+        hi = [max(v[k] for v in vs) for k in range(3)]
+        out.setdefault(tuple(round(hi[k] - lo[k], 1) for k in range(3)), []).append((lo, ss))
+    return out
+
+def _moved_brush_targets(me, fcs, solid_idx):
+    """Faces of this mesh that match no .vmf plane in place, but belong to a closed piece of geometry that is the same size as a .vmf brush:
+    a copy that was moved in Hammer (texture lock kept the mapping, so shift = .vmf shift - translation.axis / scale). Each face found gets
+    a synthetic target {ua, va, us, vs} for the moved position. -> number of faces matched"""
+    opp, efi = me["edgeOppositeIndices"][2], me["edgeFaceIndices"][2]
+    nf = len(me["faceEdgeIndices"][2])
+    nxt = me["edgeNextIndices"][2]
+    byface = {fc["fi"]: fc for fc in fcs if fc.get("pts")}
+    nb = {}
+    for fi, he in ((fc["fi"], me["faceEdgeIndices"][2][fc["fi"]]) for fc in byface.values()):
+        h, s_ = he, set()
+        for _ in range(64):
+            oh = opp[h] if h < len(opp) else -1
+            if 0 <= oh < len(efi):
+                s_.add(efi[oh])
+            h = nxt[h]
+            if h == he:
+                break
+        nb[fi] = s_
+    seen, found = set(), 0
+    for f0, fc0 in byface.items():
+        if f0 in seen or not fc0.get("nomatch"):
+            continue
+        comp, q = [], [f0]
+        seen.add(f0)
+        while q:
+            f = q.pop()
+            comp.append(f)
+            for g in nb.get(f, ()):
+                if g in byface and g not in seen and 0 <= g < nf:
+                    seen.add(g)
+                    q.append(g)
+        allp = [pt for f in comp for pt in byface[f]["pts"]]
+        lo = [min(pt[k] for pt in allp) for k in range(3)]
+        hi = [max(pt[k] for pt in allp) for k in range(3)]
+        dm = [hi[k] - lo[k] for k in range(3)]
+        cands = []
+        for dx in (-0.1, 0.0, 0.1):
+            for dy in (-0.1, 0.0, 0.1):
+                for dz in (-0.1, 0.0, 0.1):
+                    cands += solid_idx.get((round(dm[0] + dx, 1), round(dm[1] + dy, 1), round(dm[2] + dz, 1)), [])
+        best = None
+        for slo, ss in cands:
+            T = [lo[k] - slo[k] for k in range(3)]
+            good = 0
+            for f in comp:
+                c_ = byface[f]
+                q_ = [[pt[k] - T[k] for k in range(3)] for pt in c_["pts"]]
+                if any(sd["mat"] == c_["key"] and abs(abs(_v_dot(sd["n"], c_["n"])) - 1) < 1e-3 and all(abs(_v_dot(sd["n"], x) - sd["d"]) < 0.6 for x in q_) for sd in ss):
+                    good += 1
+            if best is None or good > best[0]:
+                best = (good, T, ss)
+        if not best or best[0] < 0.9 * len(comp):
+            continue
+        T, ss = best[1], best[2]
+        for f in comp:
+            c_ = byface[f]
+            if not c_.get("nomatch"):
+                continue
+            q_ = [[pt[k] - T[k] for k in range(3)] for pt in c_["pts"]]
+            hit = [sd for sd in ss if sd["mat"] == c_["key"] and abs(abs(_v_dot(sd["n"], c_["n"])) - 1) < 1e-3 and all(abs(_v_dot(sd["n"], x) - sd["d"]) < 0.6 for x in q_)]
+            if not hit or len({(tuple(sd["ua"]), tuple(sd["va"]), sd["us"], sd["vs"]) for sd in hit}) != 1:
+                continue
+            sd = hit[0]
+            if not sd["us"] or not sd["vs"] or len(sd["ua"]) != 4 or len(sd["va"]) != 4:
+                continue
+            ua, va = list(sd["ua"]), list(sd["va"])
+            ua[3] -= sum(T[k] * ua[k] for k in range(3)) / sd["us"]
+            va[3] -= sum(T[k] * va[k] for k in range(3)) / sd["vs"]
+            c_["tgt"] = dict(ua=ua, va=va, us=sd["us"], vs=sd["vs"])
+            c_["nomatch"] = False
+            found += 1
+    return found
+
+def _affine_fit2d(src, dst):
+    """Least-squares 2D affine map src -> dst: ((a0, a1, a2), (b0, b1, b2)) with u' = a0*u + a1*v + a2, v' = b0*u + b1*v + b2; None if degenerate."""
+    n = len(src)
+    A = [[sum(s_[i] * s_[j] for s_ in src) for j in range(2)] + [sum(s_[i] for s_ in src)] for i in range(2)]
+    A.append([sum(s_[j] for s_ in src) for j in range(2)] + [float(n)])
+    out = []
+    for k in (0, 1):
+        M = [A[i][:] + [sum(d_[k] * s_[i] for s_, d_ in zip(src, dst)) if i < 2 else sum(d_[k] for d_ in dst)] for i in range(3)]
+        for i in range(3):
+            p = max(range(i, 3), key=lambda r: abs(M[r][i]))
+            if abs(M[p][i]) < 1e-12:
+                return None
+            M[i], M[p] = M[p], M[i]
+            for j in range(3):
+                if j != i:
+                    f_ = M[j][i] / M[i][i]
+                    M[j] = [a_ - f_ * b_ for a_, b_ in zip(M[j], M[i])]
+        out.append(tuple(M[i][3] / M[i][i] for i in range(3)))
+    return tuple(out)
+
+_OVERLAP = []        # faces on several .vmf brushes with different mappings: (material, vertices, scale, candidate scales)
+_UNMATCHED = []      # (material, vertices, scale) of faces no .vmf side could be found for; read by the audit tooling
+
 
 def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
     """Brush faces whose texture scale the importer got wrong (it does not read the Source1 textures): compare every CMapMesh face
@@ -3186,8 +3458,20 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
     except Exception as ex:
         return [f"# cannot read {vmf_path}: {ex}"]
     idx = {}           # material -> {floor(plane distance): [sides]}   (a face looks in the neighbouring buckets of +d and -d instead of scanning every side)
+    _ts_memo = {}
+    def _ts_of(mat_):
+        if mat_ not in _ts_memo:
+            _ts_memo[mat_] = _overlay_texture_size(mat_)
+        return _ts_memo[mat_]
+    _modal_scale = {}
+    _all_idx = None      # every material's sides by plane, for a face whose own material has none
+    _alias_by_base = None      # .vmf material file name -> materials, built on first use
+    solid_idx = None   # built on first use: .vmf brushes by size (for copies that were moved in Hammer)
+    disp_by_mat = {}   # displacement sides: their faces are the displaced grid, not on the flat base plane, so they cannot be matched by plane
     for sd in sides:
-        idx.setdefault(sd["mat"], {}).setdefault(math.floor(sd["d"]), []).append(sd)
+        idx.setdefault(sd["mat"], {}).setdefault(tuple(round(x, 3) for x in sd["n"]), {}).setdefault(math.floor(sd["d"]), []).append(sd)
+        if sd.get("disp") and sd.get("bb"):
+            disp_by_mat.setdefault(sd["mat"], []).append(sd)
     lines.append(f"# {len(sides)} brush sides in {os.path.basename(vmf_path) if vmf_path else '(no .vmf: only the texture coordinates are checked)'}. Columns: action, material, faces, detail. "
                  f"A face is broken when its scale is below 0.01 or above 8 AND vmap scale / vmf scale is outside {lo:g}..{hi:g}.")
     for vp in vmap_paths:
@@ -3201,6 +3485,7 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
             continue
         stat = __import__("collections").Counter()
         faces = []      # (mat, scale_off, uoff, voff, sc, u, v, ratio or None)
+        subs = []       # displacement meshes: (first face, last face + 1, (file offset, values) of the subdivided surface's texture coordinates)
         for e in els:
             if e["type"] != "CMapMesh":
                 continue
@@ -3227,19 +3512,36 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
                     pos = els[si]["attrs"]["data"][2]
             if not pos:
                 continue
-            tcs = None
+            tcs, tgs, nrs = None, None, None
             if me.get("faceVertexData") and "edgeVertexDataIndices" in me:
                 for si in els[me["faceVertexData"][2]]["attrs"].get("streams", (0, 0, []))[2]:
                     if isinstance(si, int) and els[si]["name"].lower().startswith("texcoord") and "data" in els[si].get("offs", {}):
                         tcs = (els[si]["offs"]["data"], els[si]["attrs"]["data"][2])
+                    elif isinstance(si, int) and els[si]["name"].lower().startswith("tangent") and "data" in els[si].get("offs", {}):
+                        tgs = (els[si]["offs"]["data"], els[si]["attrs"]["data"][2])
+                    elif isinstance(si, int) and els[si]["name"].lower().startswith("normal"):
+                        nrs = els[si]["attrs"]["data"][2]
             evd = me["edgeVertexDataIndices"][2] if tcs else []
             evi, nxt, vdi = me["edgeVertexIndices"][2], me["edgeNextIndices"][2], me["vertexDataIndices"][2]
             scs, us, vs_, mis = (st[k]["attrs"]["data"][2] for k in ("textureScale", "textureAxisU", "textureAxisV", "materialindex"))
+            _mesh_start = len(faces)
+            _sub = None
+            try:
+                _sdi = me.get("subdivisionData")
+                if _sdi and isinstance(_sdi[2], int):
+                    for si in els[_sdi[2]]["attrs"].get("streams", (0, 0, []))[2]:
+                        if isinstance(si, int) and els[si]["name"].lower().startswith("texcoord") and "data" in els[si].get("offs", {}):
+                            _sub = (els[si]["offs"]["data"], els[si]["attrs"]["data"][2])
+            except Exception:
+                _sub = None
+            _fdi = me["faceDataIndices"][2] if "faceDataIndices" in me else None
             for f, he in enumerate(me["faceEdgeIndices"][2]):
-                if f >= len(scs) or not (0 <= mis[f] < len(mats)):
+                fd_ = _fdi[f] if _fdi and f < len(_fdi) and 0 <= _fdi[f] else f      # face -> face data row (identity in every vmap seen so far)
+                if fd_ >= len(scs) or not (0 <= mis[fd_] < len(mats)):
                     continue
-                mat = mats[mis[f]].replace("\\", "/").lower()
+                mat = mats[mis[fd_]].replace("\\", "/").lower()
                 ratio, uvv, tgt = None, None, None
+                pts, n, key, nomatch = None, None, None, False
                 if ident:
                     pts, hs, h = [], [], he
                     for _ in range(64):
@@ -3252,45 +3554,277 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
                         uvv = [(pts[i], evd[hs[i]]) for i in range(len(pts))]
                     if len(pts) >= 3 and sides:
                         n = _v_norm(_v_cross(_v_sub(pts[1], pts[0]), _v_sub(pts[2], pts[0])))
-                        d = _v_dot(n, pts[0])
+                        # a vertex that is a fraction of a unit off (the importer rounds some brush corners) tilts a triangle's normal by ~0.001,
+                        # which moves "plane distance" by several units at map coordinates in the thousands: snap near-axis normals to the axis
+                        # and measure the distance at the face centre instead of at one corner
+                        for _k in range(3):
+                            if abs(n[_k]) > 0.999:
+                                n = [(1.0 if n[_k] > 0 else -1.0) if j == _k else 0.0 for j in range(3)]
+                                break
+                        _c0 = [sum(q[j] for q in pts) / len(pts) for j in range(3)]
                         key = mat[len("materials/"):-5] if mat.startswith("materials/") and mat.endswith(".vmat") else mat
+                        if key not in idx:
+                            # the material was renamed on its way into the vmap (a different folder, e.g. mytextures/stone-blocks for giza/stone-blocks):
+                            # the .vmf's material with the same file name stands in for it, if there is exactly one
+                            if _alias_by_base is None:
+                                _alias_by_base = {}
+                                for _k in idx:
+                                    _alias_by_base.setdefault(_k.rsplit("/", 1)[-1], set()).add(_k)
+                            _al = _alias_by_base.get(key.rsplit("/", 1)[-1], ())
+                            if len(_al) == 1:
+                                key = next(iter(_al))
+                                stat["material renamed in the vmap, matched to the .vmf material with the same file name"] += 1
                         _bk = idx.get(key, {})
-                        _bs = sorted({b_ for c_ in (math.floor(d), math.floor(-d)) for b_ in (c_ - 1, c_, c_ + 1)})
-                        cands = [s_ for b_ in _bs for s_ in _bk.get(b_, [])
-                                 if (_v_dot(s_["n"], n) > 0.999 and abs(s_["d"] - d) < 0.5) or (_v_dot(s_["n"], n) < -0.999 and abs(s_["d"] + d) < 0.5)]
+                        # a side matches when the normals agree and every vertex of the face lies on its plane (0.6 units: covers the importer's rounding).
+                        # Sides are grouped by their own exact normal and looked up by the face centre's distance along that normal: a small tilt of a
+                        # triangle's own normal would move its plane distance by metres at map coordinates in the thousands
+                        cands = []
+                        for _nk, _bb in _bk.items():
+                            if abs(_v_dot(_nk, n)) <= 0.99:
+                                continue
+                            _fl = math.floor(_v_dot(_nk, _c0))
+                            for b_ in (_fl - 1, _fl, _fl + 1):
+                                for s_ in _bb.get(b_, ()):
+                                    if all(abs(_v_dot(s_["n"], q) - s_["d"]) < 0.6 for q in pts):
+                                        cands.append(s_)
+                        if not cands:
+                            # a sliver (a triangle a fraction of a unit thick, left over when the importer cut a brush into many pieces) has no usable
+                            # normal of its own: a vertex that is 0.1 off tilts it by tens of degrees. Ignore the normal and look for any side of this
+                            # material whose plane holds every vertex and whose brush contains the whole face
+                            for _nk, _bb in _bk.items():
+                                _fl = math.floor(_v_dot(_nk, _c0))
+                                for b_ in (_fl - 1, _fl, _fl + 1):
+                                    for s_ in _bb.get(b_, ()):
+                                        if all(abs(_v_dot(s_["n"], q) - s_["d"]) < 0.6 for q in pts) and all(_v_dot(n_, q) - d_ <= 0.6 for n_, d_ in s_["solid"] for q in pts):
+                                            cands.append(s_)
+                            if cands:
+                                stat["sliver triangle matched by its vertices instead of its own normal"] += 1
+                        if not cands:
+                            # vertices a little further off the plane (the importer rounds some corners of rotated brushes by 1-2 units): same lookup with a
+                            # 2.5 unit tolerance, only where the normals agree and the whole face lies inside the brush
+                            for _nk, _bb in _bk.items():
+                                if abs(_v_dot(_nk, n)) <= 0.99:
+                                    continue
+                                _fl = math.floor(_v_dot(_nk, _c0))
+                                for b_ in range(_fl - 3, _fl + 4):
+                                    for s_ in _bb.get(b_, ()):
+                                        if all(abs(_v_dot(s_["n"], q) - s_["d"]) < 2.5 for q in pts) and all(_v_dot(n_, q) - d_ <= 2.5 for n_, d_ in s_["solid"] for q in pts):
+                                            cands.append(s_)
+                            if cands:
+                                stat["face a little off its .vmf plane (rounded corners) matched with a 2.5 unit tolerance"] += 1
+                            if not cands:
+                                # a whole flat face parallel to its .vmf plane but pushed out by up to ~6 units (chamfered / rounded pillars): take only the nearest
+                                # such plane, and only if the face is flat (all vertices at one distance), nearly parallel, and inside the brush
+                                _best = []
+                                for _nk, _bb in _bk.items():
+                                    if abs(_v_dot(_nk, n)) <= 0.999:
+                                        continue
+                                    _fl = math.floor(_v_dot(_nk, _c0))
+                                    for b_ in range(_fl - 7, _fl + 8):
+                                        for s_ in _bb.get(b_, ()):
+                                            _ds = [_v_dot(s_["n"], q) - s_["d"] for q in pts]
+                                            if max(_ds) - min(_ds) > 0.6 or max(abs(x) for x in _ds) >= 6.0:
+                                                continue
+                                            _tol = max(abs(x) for x in _ds) + 0.6
+                                            if all(_v_dot(n_, q) - d_ <= _tol for n_, d_ in s_["solid"] for q in pts):
+                                                _best.append((max(abs(x) for x in _ds), s_))
+                                if _best:
+                                    _m = min(x for x, _ in _best)
+                                    cands = [s_ for x, s_ in _best if x <= _m + 0.5]
+                                    stat["flat face pushed off its .vmf plane (up to 6 units) matched to the nearest plane"] += 1
                         if len(cands) > 1:
                             # brushes that overlap in this plane (adjacent blocks, stacked boxes): keep the one the face actually lies inside
                             cen = [sum(q[j] for q in pts) / len(pts) for j in range(3)]
+                            cv = [c for c in cands if all(_v_dot(n_, q) - d_ <= 0.6 for n_, d_ in c["solid"] for q in pts)]      # the whole face inside the brush
+                            if cv:
+                                cands = cv
                             c0 = [c for c in cands if all(_v_dot(n_, cen) - d_ <= 0.6 for n_, d_ in c["solid"])]
                             if c0:
                                 cands = c0
                         if len(cands) > 1:
                             # several brushes share this plane + material (e.g. crates rotated differently on one floor): keep the sides whose texture
                             # axes are the ones stored on this face, then those whose shift agrees with the stored one modulo 16 (the importer's reduction)
-                            c1 = [c for c in cands if len(c["ua"]) == 4 and sum(abs(c["ua"][k] - us[f][k]) + abs(c["va"][k] - vs_[f][k]) for k in range(3)) < 0.02]
+                            c1 = [c for c in cands if len(c["ua"]) == 4 and sum(abs(c["ua"][k] - us[fd_][k]) + abs(c["va"][k] - vs_[fd_][k]) for k in range(3)) < 0.02]
                             if c1:
                                 cands = c1
                             if len(cands) > 1:
                                 c2 = [c for c in cands if len(c["ua"]) == 4 and all(min((c[ax][3] - cur[3]) % 16.0, 16.0 - (c[ax][3] - cur[3]) % 16.0) < 0.1
-                                                                                      for ax, cur in (("ua", us[f]), ("va", vs_[f])))]
+                                                                                      for ax, cur in (("ua", us[fd_]), ("va", vs_[fd_])))]
                                 if c2:
                                     cands = c2
+                            if len(cands) > 1 and uvv:
+                                # still several (e.g. neighbouring tiles that differ only in shift): the stored texture coordinates of a face the importer got
+                                # right follow exactly one of them
+                                _tsz = _ts_of(mat)
+                                if _tsz:
+                                    def _uverr(c):
+                                        e_ = 0.0
+                                        for (P_, ti_) in uvv:
+                                            nu_ = (sum(P_[k] * c["ua"][k] for k in range(3)) / c["us"] + c["ua"][3]) / _tsz[0]
+                                            nv_ = (sum(P_[k] * c["va"][k] for k in range(3)) / c["vs"] + c["va"][3]) / _tsz[1]
+                                            du_, dv_ = (tcs[1][ti_][0] - nu_) % 1.0, (tcs[1][ti_][1] - nv_) % 1.0
+                                            e_ = max(e_, min(du_, 1 - du_), min(dv_, 1 - dv_))
+                                        return e_
+                                    c3 = [c for c in cands if c["us"] and c["vs"] and len(c["ua"]) == 4 and len(c["va"]) == 4 and _uverr(c) < 0.004]
+                                    if c3:
+                                        cands = c3
                         if cands:
-                            sd = min(cands, key=lambda c: abs(scs[f][0] / c["us"] - 1) + abs(scs[f][1] / c["vs"] - 1))      # coplanar sides: take the closest scale
+                            sd = min(cands, key=lambda c: abs(scs[fd_][0] / c["us"] - 1) + abs(scs[fd_][1] / c["vs"] - 1))      # coplanar sides: take the closest scale
                             if sd["us"] and sd["vs"]:
-                                ratio = (scs[f][0] / sd["us"], scs[f][1] / sd["vs"])
+                                ratio = (scs[fd_][0] / sd["us"], scs[fd_][1] / sd["vs"])
                             # unambiguous: every coplanar side of this material maps the texture identically -> its mapping is the truth for this face
                             if len(sd["ua"]) == 4 and len(sd["va"]) == 4 and all(
                                     max(abs(c["ua"][k] - sd["ua"][k]) + abs(c["va"][k] - sd["va"][k]) for k in range(4)) < 0.01
                                     and abs(c["us"] - sd["us"]) < 1e-4 and abs(c["vs"] - sd["vs"]) < 1e-4 for c in cands):
                                 tgt = sd
                         else:
-                            stat["no .vmf brush on this plane + material"] += 1
+                            # displacement: the face lies over a displacement brush of this material (its base block's footprint, any height)
+                            _ds = []
+                            if True:      # not only absurd scales: the importer also leaves displacement faces at a plausible-looking but wrong ~1/32 scale
+                                _ds = [c for c in disp_by_mat.get(key, [])
+                                       if abs(_v_dot(c["n"], n)) > 0.3 and all(
+                                           c["bb"][0][j] - (16 if abs(c["n"][j]) < 0.5 else 256) <= _c0[j] <= c["bb"][1][j] + (16 if abs(c["n"][j]) < 0.5 else 256)
+                                           for j in range(3))]
+                            if len(_ds) > 1:      # several displacements stacked over this spot: the one whose base block is closest in height
+                                _gap = lambda c: sum(max(c["bb"][0][j] - _c0[j], _c0[j] - c["bb"][1][j], 0.0) for j in range(3) if abs(c["n"][j]) >= 0.5)   # noqa: E731
+                                _g0 = min(_gap(c) for c in _ds)
+                                _ds = [c for c in _ds if _gap(c) <= _g0 + 24]
+                            if len({(tuple(c["ua"]), tuple(c["va"]), c["us"], c["vs"]) for c in _ds}) == 1:
+                                tgt = _ds[0]
+                                stat["on a displacement (mapping copied from the displacement's base face)"] += 1
+                            else:
+                                stat["no .vmf brush on this plane + material"] += 1
+                                nomatch = True
                         if cands and not tgt:
+                            _OVERLAP.append((key, pts, tuple(scs[fd_]), sorted({(round(c["us"], 4), round(c["vs"], 4)) for c in cands})))
                             stat["several .vmf brushes with different mappings overlap this face (left as imported)"] += 1
-                faces.append(dict(mat=mat, so=st["textureScale"]["offs"]["data"] + 8 * f, uo=st["textureAxisU"]["offs"]["data"] + 16 * f,
-                                  vo=st["textureAxisV"]["offs"]["data"] + 16 * f, sc=scs[f], u=us[f], v=vs_[f], ratio=ratio, tgt=tgt,
-                                  uv=uvv, tco=tcs[0] if tcs else None, tcd=tcs[1] if tcs else None))
+                faces.append(dict(mat=mat, so=st["textureScale"]["offs"]["data"] + 8 * fd_, uo=st["textureAxisU"]["offs"]["data"] + 16 * fd_,
+                                  vo=st["textureAxisV"]["offs"]["data"] + 16 * fd_, sc=scs[fd_], u=us[fd_], v=vs_[fd_], ratio=ratio, tgt=tgt,
+                                  uv=uvv, tco=tcs[0] if tcs else None, tcd=tcs[1] if tcs else None, tgs=tgs, nrs=nrs,
+                                  fi=f, pts=pts if ident else None, n=n, key=key, nomatch=nomatch))
+            if _sub and ident and tcs and len(faces) > _mesh_start:
+                subs.append((_mesh_start, len(faces), _sub, tuple(o)))
+            if ident and sides and any(fc_["nomatch"] for fc_ in faces[_mesh_start:]) and all(k_ in me for k_ in ("edgeOppositeIndices", "edgeFaceIndices")):
+                if solid_idx is None:
+                    solid_idx = _solid_index(sides)
+                _nm = _moved_brush_targets(me, faces[_mesh_start:], solid_idx)
+                if _nm:
+                    stat["on a copy of a .vmf brush that was moved in Hammer (mapping copied, shift corrected for the move)"] += _nm
+                    stat["no .vmf brush on this plane + material"] -= _nm
+            if ident and sides:
+                # a sliver (under 1 unit across) with no .vmf side: nothing to copy, and the importer's scale for it is arbitrary (0.0006, 77...). It cannot
+                # be seen, so give it the scale most of this material's .vmf sides use instead of leaving a number that looks broken in Hammer
+                for fc_ in faces[_mesh_start:]:
+                    if not fc_["nomatch"] or fc_["tgt"] or not fc_["pts"] or fc_["key"] not in idx:
+                        continue
+                    _p = fc_["pts"]
+                    if len(_p) != 3:
+                        continue
+                    _cr = _v_cross(_v_sub(_p[1], _p[0]), _v_sub(_p[2], _p[0]))
+                    _L = max(math.dist(_p[0], _p[1]), math.dist(_p[1], _p[2]), math.dist(_p[0], _p[2]))
+                    if not _L or math.sqrt(sum(x * x for x in _cr)) / _L >= 1.0:
+                        continue
+                    if fc_["key"] not in _modal_scale:
+                        _cn = __import__("collections").Counter((round(sd_["us"], 4), round(sd_["vs"], 4)) for _b in idx[fc_["key"]].values() for _l in _b.values() for sd_ in _l
+                                                                if sd_["us"] and sd_["vs"] and not sd_.get("disp"))
+                        _modal_scale[fc_["key"]] = (_cn.most_common(1)[0][0], list(_cn)) if _cn else None
+                    if not _modal_scale[fc_["key"]]:
+                        continue
+                    _ms, _all = _modal_scale[fc_["key"]]
+                    if any(abs(fc_["sc"][0] - a_) < 0.02 * a_ and abs(fc_["sc"][1] - b_) < 0.02 * b_ for a_, b_ in _all):
+                        continue
+                    fc_["tgt"] = dict(ua=list(fc_["u"]), va=list(fc_["v"]), us=_ms[0], vs=_ms[1])
+                    fc_["nomatch"] = False
+                    stat["sliver with no .vmf side given the material's usual scale"] += 1
+                    stat["no .vmf brush on this plane + material"] -= 1
+                # same geometry, different material (a water shader, a swapped texture) and an absurd scale: the .vmf face on this plane still
+                # says how the original was mapped, so take its mapping rather than leave a scale like 0.002
+                for fc_ in faces[_mesh_start:]:
+                    if not fc_["nomatch"] or fc_["tgt"] or not fc_["pts"] or not _scale_bad(fc_["sc"]) or fc_["key"].startswith("tools/"):
+                        continue
+                    if _all_idx is None:
+                        _all_idx = {}
+                        for _k in idx:
+                            if _k.startswith("tools/"):
+                                continue
+                            for _nkey, _bb_ in idx[_k].items():
+                                for _b, _l in _bb_.items():
+                                    _all_idx.setdefault(_nkey, {}).setdefault(_b, []).extend(sd_ for sd_ in _l if not sd_.get("disp"))
+                    _pp, _nn = fc_["pts"], fc_["n"]
+                    _cc = [sum(q[j] for q in _pp) / len(_pp) for j in range(3)]
+                    _hit = []
+                    for _tol in (0.6, 2.5):
+                        for _nk, _bb_ in _all_idx.items():
+                            if abs(_v_dot(_nk, _nn)) <= 0.99:
+                                continue
+                            _fl = math.floor(_v_dot(_nk, _cc))
+                            for b_ in range(_fl - 3, _fl + 4):
+                                for sd_ in _bb_.get(b_, ()):
+                                    if len(sd_["ua"]) == 4 and len(sd_["va"]) == 4 and sd_["us"] and sd_["vs"] \
+                                            and all(abs(_v_dot(sd_["n"], q) - sd_["d"]) < _tol for q in _pp) \
+                                            and all(_v_dot(n_, q) - d_ <= _tol for n_, d_ in sd_["solid"] for q in _pp):
+                                        _hit.append(sd_)
+                        if _hit:
+                            break
+                    if _hit and len({(tuple(h_["ua"]), tuple(h_["va"]), h_["us"], h_["vs"]) for h_ in _hit}) == 1:
+                        fc_["tgt"] = dict(ua=list(_hit[0]["ua"]), va=list(_hit[0]["va"]), us=_hit[0]["us"], vs=_hit[0]["vs"])
+                        fc_["nomatch"] = False
+                        stat["absurd scale on a face whose .vmf brush has a different material: mapping copied from that brush"] += 1
+                        stat["no .vmf brush on this plane + material"] -= 1
+                _UNMATCHED.extend((fc_["mat"], fc_["pts"], tuple(fc_["sc"])) for fc_ in faces[_mesh_start:] if fc_["nomatch"] and not fc_["tgt"])
+        # a whole part of the level that was moved by the same amount in Hammer (a floor, a level): the faces left over are the translated copies
+        # of .vmf geometry. Find the translations that many materials agree on, then re-test the leftover faces against the .vmf at that offset
+        _left = [fc_ for fc_ in faces if fc_.get("nomatch") and not fc_["tgt"] and fc_.get("pts") and fc_["key"] in idx]
+        if MATCH_MOVED_LEVELS and len(_left) >= 8:
+            import itertools
+            from collections import Counter as _C
+            _votes, _vsum, _bymat = _C(), _C(), {}
+            for fc_ in _left:
+                _bymat.setdefault(fc_["key"], []).append(fc_)
+            for k_, fl_ in _bymat.items():
+                _ss = [sd_ for _b in idx[k_].values() for _l in _b.values() for sd_ in _l if sd_.get("bb")]
+                if not _ss or len(_ss) > 400:
+                    continue
+                _W = {tuple(round(c_) for c_ in cc_) for sd_ in _ss for cc_ in itertools.product(*[(sd_["bb"][0][j], sd_["bb"][1][j]) for j in range(3)])}
+                _V = {tuple(round(c_) for c_ in q_) for fc_ in fl_[:300] for q_ in fc_["pts"]}
+                if len(_V) * len(_W) > 3_000_000:
+                    continue
+                _cn = _C()
+                for v_ in _V:
+                    for w_ in _W:
+                        _cn[(v_[0] - w_[0], v_[1] - w_[1], v_[2] - w_[2])] += 1
+                for t_, n_ in _cn.most_common(3):
+                    if n_ >= 8 and t_ != (0, 0, 0):
+                        _votes[t_] += 1
+                        _vsum[t_] += n_
+            _Ts = [t_ for t_, n_ in _vsum.most_common(6) if _votes[t_] >= 2 or n_ >= 40]
+            _nt = 0
+            for fc_ in _left:
+                _hits = []
+                for T_ in _Ts:
+                    q_ = [[pt_[k] - T_[k] for k in range(3)] for pt_ in fc_["pts"]]
+                    _bk2 = idx.get(fc_["key"], {})
+                    for _nk, _bb in _bk2.items():
+                        if abs(_v_dot(_nk, fc_["n"])) <= 0.99:
+                            continue
+                        _fl = math.floor(_v_dot(_nk, [sum(x_[j] for x_ in q_) / len(q_) for j in range(3)]))
+                        for b_ in (_fl - 1, _fl, _fl + 1):
+                            for sd_ in _bb.get(b_, ()):
+                                if sd_["us"] and sd_["vs"] and len(sd_["ua"]) == 4 and len(sd_["va"]) == 4 \
+                                        and all(abs(_v_dot(sd_["n"], x_) - sd_["d"]) < 0.6 for x_ in q_) \
+                                        and all(_v_dot(n_, x_) - d_ <= 0.6 for n_, d_ in sd_["solid"] for x_ in q_):
+                                    _hits.append((T_, sd_))
+                if _hits and len({(h_[0], tuple(h_[1]["ua"]), tuple(h_[1]["va"]), h_[1]["us"], h_[1]["vs"]) for h_ in _hits}) == 1:
+                    T_, sd_ = _hits[0]
+                    ua_, va_ = list(sd_["ua"]), list(sd_["va"])
+                    ua_[3] -= sum(T_[k] * ua_[k] for k in range(3)) / sd_["us"]
+                    va_[3] -= sum(T_[k] * va_[k] for k in range(3)) / sd_["vs"]
+                    fc_["tgt"] = dict(ua=ua_, va=va_, us=sd_["us"], vs=sd_["vs"])
+                    fc_["nomatch"] = False
+                    _nt += 1
+            if _nt:
+                stat["geometry moved as a whole in Hammer (offset " + "; ".join("%d %d %d" % t_ for t_ in _Ts) + "): mapping copied, shift corrected for the move"] += _nt
+                stat["no .vmf brush on this plane + material"] -= _nt
         per = {}
         for fc in faces:
             per.setdefault(fc["mat"], []).append(fc)
@@ -3306,9 +3840,11 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
                 if sum(1 for r in bad if abs(r[0] / fac[0] - 1) < 0.02 and abs(r[1] / fac[1] - 1) < 0.02) < 0.8 * len(bad):
                     fac = None
             cnt = fixed.setdefault(mat, [0, 0, 0, 0])
-            ts = _overlay_texture_size(mat)         # (width, height, decalscale) of the Source1 texture, or None
+            ts_known = bool(_addon_texture_size(mat) or _overlay_texture_size(mat))
+            ts = _addon_texture_size(mat) or _overlay_texture_size(mat)         # (width, height, decalscale): the converted addon texture first (what Hammer draws), then the Source1 one
             if not ts and not any(_scale_bad(fc["sc"]) for fc in fl):
-                # no Source1 texture: use the size the stored coordinates imply (what Hammer itself used for this material)
+                # no Source1 or addon texture: use the size the stored coordinates imply (what Hammer itself used for this material). Not done for
+                # materials with broken scales: their stored coordinates may follow either the old or the corrected numbers, so a size inferred from them is a guess
                 tv_ = [__import__("collections").Counter(), __import__("collections").Counter()]
                 for fc in fl[:400]:
                     if not fc["uv"]:
@@ -3329,6 +3865,12 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
                 r = fc["ratio"]
                 fix_scale = False
                 if r and _scale_bad(fc["sc"]) and not (lo <= r[0] <= hi and lo <= r[1] <= hi):
+                    fix_scale = True
+                elif r and not (lo <= r[0] <= hi and lo <= r[1] <= hi) and all(
+                        any(abs(math.log2(max(x, 1e-9)) - round(math.log2(max(x, 1e-9)))) < 0.06 and abs(round(math.log2(max(x, 1e-9)))) >= 3 for x in (r[0], r[1]))
+                        for _ in (0,)) and fc["tgt"] is None:
+                    # a scale that is not "absurd" (0.016) but exactly a power of two (8x to 512x) away from the one .vmf brush it sits on, with
+                    # nothing in the .vmf to explain it: the importer's divide, not a deliberate change
                     fix_scale = True
                 elif not r and fac and _scale_bad(fc["sc"]):
                     r, fix_scale = fac, True
@@ -3357,7 +3899,7 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
                 # stored texture coordinates: Hammer draws these, not the scale/shift numbers (those only matter once a face is edited).
                 # Source1 formula (verified on this vmap): u = (P.axisU / scaleU + shiftU) / texture width, P = world position
                 if ts and fc["uv"] and not _scale_bad(sc2):
-                    wrongs = fix_scale
+                    wrongs = fix_scale and ts_known      # a size inferred from the stored coordinates is only trusted to repair faces that disagree with their numbers
                     if not wrongs:
                         for (P, ti) in fc["uv"]:           # does every stored coordinate equal the formula (up to whole texture repeats)?
                             nu = (sum(P[k] * u2[k] for k in range(3)) / sc2[0] + u2[3]) / ts[0]
@@ -3374,10 +3916,120 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
                             nu = (sum(P[k] * u2[k] for k in range(3)) / sc2[0] + u2[3]) / ts[0]
                             nv = (sum(P[k] * v2[k] for k in range(3)) / sc2[1] + v2[3]) / ts[1]
                             struct.pack_into("<2f", data, fc["tco"] + 8 * ti, nu, nv)
+                            fc.setdefault("newtc", {})[ti] = (nu, nv)
                         cnt[3] += 1
                 elif fix_scale and not ts:
                     cnt[2] += 0
                     no_tex.add(mat)
+        # tangents: Hammer stores one per face corner (the direction of increasing U across the face, w = +-1 handedness) and normal-mapped
+        # materials are lit with them. They were left pointing along the OLD texture axis on every face whose coordinates were rewritten.
+        # Hammer's rule, checked against 156,000 untouched face corners of the goldeneye vmap (99.0% match): T = the surface direction in which
+        # U grows and V stays constant (from the face's positions and texture coordinates), projected perpendicular to the stored normal;
+        # w = +1 when cross(normal, T) points the way V grows. A face is only touched when its OLD tangent followed that rule with its OLD
+        # coordinates (displacements and other odd faces do not, and are left alone).
+        n_tan = n_tan_skip = 0
+        def _face_tangents(fc_, tc_of):
+            out_ = {}
+            P_ = [p_ for (p_, _t) in fc_["uv"]]
+            UV_ = [tc_of(t_) for (_p, t_) in fc_["uv"]]
+            for i_ in range(1, len(P_) - 1):
+                e1_, e2_ = _v_sub(P_[i_], P_[0]), _v_sub(P_[i_ + 1], P_[0])
+                du1, dv1, du2, dv2 = UV_[i_][0] - UV_[0][0], UV_[i_][1] - UV_[0][1], UV_[i_ + 1][0] - UV_[0][0], UV_[i_ + 1][1] - UV_[0][1]
+                det = du1 * dv2 - du2 * dv1
+                if abs(det) < 1e-12:
+                    continue
+                T_ = [(e1_[k] * dv2 - e2_[k] * dv1) / det for k in range(3)]
+                B_ = [(e2_[k] * du1 - e1_[k] * du2) / det for k in range(3)]
+                for (_p, t_) in fc_["uv"]:
+                    nn_ = fc_["nrs"][t_]
+                    ln_ = math.sqrt(_v_dot(nn_, nn_))
+                    if ln_ < 1e-9:
+                        continue
+                    nn_ = [c / ln_ for c in nn_[:3]]
+                    d_ = _v_dot(nn_, T_)
+                    Tp = [T_[k] - nn_[k] * d_ for k in range(3)]
+                    lt_ = math.sqrt(_v_dot(Tp, Tp))
+                    if lt_ < 1e-9:
+                        continue
+                    Tp = [c / lt_ for c in Tp]
+                    out_[t_] = (Tp, 1.0 if _v_dot(_v_cross(nn_, Tp), B_) > 0 else -1.0)
+                return out_
+            return out_
+        for fc in faces:
+            if not fc.get("newtc") or not fc.get("tgs") or not fc.get("nrs") or not fc["uv"]:
+                continue
+            try:
+                old_ = _face_tangents(fc, lambda t_: fc["tcd"][t_])
+                new_ = _face_tangents(fc, lambda t_: fc["newtc"].get(t_, tuple(fc["tcd"][t_][:2])))
+                tgo, tgd = fc["tgs"]
+                ok_ = bool(old_) and len(old_) == len(fc["uv"]) and len(new_) == len(old_) and all(
+                    _v_dot(old_[t_][0], tgd[t_][:3]) > 0.999 and old_[t_][1] == tgd[t_][3] for t_ in old_)
+                if not ok_:
+                    n_tan_skip += 1
+                    continue
+                for t_, (T_, w_) in new_.items():
+                    struct.pack_into("<4f", data, tgo + 16 * t_, T_[0], T_[1], T_[2], w_)
+                n_tan += 1
+            except Exception:
+                n_tan_skip += 1
+        if n_tan:
+            stat["tangents recomputed to follow the rewritten texture coordinates"] += n_tan
+        if n_tan_skip:
+            stat["faces whose old tangent did not follow its coordinates (tangent left as is)"] += n_tan_skip
+        # displacements keep their own copy of the texture coordinates for every vertex of the subdivided surface; Hammer draws these, so when the
+        # corner coordinates of a base face changed they have to move with them: for each face the old -> new corner mapping is a 2D affine map
+        n_sub = 0
+        stale_disp = []
+        for (_f0, _f1, (_so, _sv), _org) in subs:
+            try:
+                _fits = []
+                for fc_ in faces[_f0:_f1]:
+                    if not fc_["uv"] or not fc_.get("newtc"):
+                        continue
+                    _src = [tuple(fc_["tcd"][ti_][:2]) for (_P, ti_) in fc_["uv"]]
+                    _dst = [fc_["newtc"].get(ti_, tuple(fc_["tcd"][ti_][:2])) for (_P, ti_) in fc_["uv"]]
+                    if len(_src) < 3 or max(abs(a_[0] - b_[0]) + abs(a_[1] - b_[1]) for a_, b_ in zip(_src, _dst)) < 1e-4:
+                        continue
+                    _fit = _affine_fit2d(_src, _dst)
+                    if _fit:
+                        _us, _vs = [q[0] for q in _src], [q[1] for q in _src]
+                        _fits.append((_fit, min(_us), max(_us), min(_vs), max(_vs)))
+                for i_, (u_, v_) in enumerate(_sv if _fits else ()):
+                    _best = None
+                    for (_fit, u0, u1, v0, v1) in _fits:
+                        mu_, mv_ = 0.02 * (u1 - u0) + 1e-3, 0.02 * (v1 - v0) + 1e-3
+                        if u0 - mu_ <= u_ <= u1 + mu_ and v0 - mv_ <= v_ <= v1 + mv_:
+                            _area = (u1 - u0) * (v1 - v0)
+                            if _best is None or _area < _best[0]:
+                                _best = (_area, _fit)
+                    if _best:
+                        (a0, a1, a2), (b0, b1, b2) = _best[1]
+                        struct.pack_into("<2f", data, _so + 8 * i_, a0 * u_ + a1 * v_ + a2, b0 * u_ + b1 * v_ + b2)
+                        n_sub += 1
+                # entries that still lie outside every face's corner range were not matched to a face: the table is out of date for this mesh
+                _boxes = []
+                for fc_ in faces[_f0:_f1]:
+                    if fc_["uv"]:
+                        _c = [fc_.get("newtc", {}).get(ti_, tuple(fc_["tcd"][ti_][:2])) for (_P, ti_) in fc_["uv"]]
+                        _du, _dv = max(q[0] for q in _c) - min(q[0] for q in _c), max(q[1] for q in _c) - min(q[1] for q in _c)
+                        _boxes.append((min(q[0] for q in _c) - 0.02 * _du - 1e-3, max(q[0] for q in _c) + 0.02 * _du + 1e-3,
+                                       min(q[1] for q in _c) - 0.02 * _dv - 1e-3, max(q[1] for q in _c) + 0.02 * _dv + 1e-3))
+                if _boxes:
+                    _cur = struct.unpack_from("<%df" % (2 * len(_sv)), data, _so)
+                    _out = sum(1 for i_ in range(len(_sv)) if not any(b0 <= _cur[2 * i_] <= b1 and c0 <= _cur[2 * i_ + 1] <= c1 for (b0, b1, c0, c1) in _boxes))
+                    if _out > 0.25 * len(_sv):
+                        stale_disp.append(_org)
+            except Exception as ex_:
+                lines.append(f"# displacement texture coordinates not updated for one mesh: {ex_}")
+        if n_sub:
+            stat["displacement surface texture coordinates moved with their base face"] += n_sub
+        if stale_disp:
+            lines.append(f"# {len(stale_disp)} displacement mesh(es) still have an out-of-date subdivided-surface texture table (origins): "
+                         + "; ".join("%.0f %.0f %.0f" % o_ for o_ in stale_disp))
+            print(f"  [NOTE] {len(stale_disp)} displacement mesh(es) look unfinished in Hammer (stale subdivision texture table, usually from a map fixed on an earlier run). "
+                  "Select them and nudge one step and back to rebuild it. Origins: " + "; ".join("%.0f %.0f %.0f" % o_ for o_ in stale_disp[:12]))
+        if no_tex:
+            print("  [NOTE] face scales: no texture size known for " + ", ".join(sorted(no_tex)[:6]) + ": their texture coordinates were NOT rewritten (see the face_scale_fix log)")
         total = sum(c[0] + c[1] + c[3] for c in fixed.values())
         _tg = sum(1 for fc in faces if fc["tgt"])
         lines.append(f"# {os.path.basename(str(vp))}: {len(faces)} brush faces, {_tg} matched to exactly one .vmf mapping" +
@@ -3408,6 +4060,132 @@ def fix_face_scales(vmap_paths, vmf_path: str, out_dir: str, in_place=True):
         else:
             lines.append(f"# {os.path.basename(str(vp))}: no broken face scales found (nothing patched, no backup)")
             print(f"  face scales: no broken face scales in {os.path.basename(str(vp))}")
+    return lines
+
+def report_absurd_scale_faces(vmap_paths, vmf_path: str):
+    """Every brush face whose texture scale is still out of range (<0.01 or >8) after the repair, with what the Source1 files say about its
+    material: the .vmf's scales for that material, the .vmt's $basetexture and texture size. A face whose scale equals one the .vmf
+    really uses for that material is legitimate (deliberate stretched scales); the rest are broken, and a material whose .vmf sides all
+    share one scale tells you what these faces should be. Needs no extra files. -> report lines (also lists every face's position)."""
+    import collections
+    lines = []
+    try:
+        sides = _vmf_sides(_vmf_tree(vmf_path)) if vmf_path else []
+    except Exception:
+        sides = []
+    bymat = collections.defaultdict(list)
+    for sd in sides:
+        bymat[sd["mat"]].append(sd)
+    rows = []        # (material, mesh label, centroid, scale, shift)
+    for vp in vmap_paths:
+        try:
+            data = Path(vp).read_bytes()
+            if b"encoding binary" not in data[:100]:
+                continue
+            els = read_binary_dmx(data)
+        except Exception:
+            continue
+        par = {}
+        for i, e in enumerate(els):
+            ch = e["attrs"].get("children")
+            if ch and isinstance(ch[2], list):
+                for c in ch[2]:
+                    if isinstance(c, int):
+                        par[c] = i
+        for ei, e in enumerate(els):
+            if e["type"] != "CMapMesh":
+                continue
+            a = e["attrs"]
+            md = a.get("meshData")
+            if not md or not isinstance(md[2], int):
+                continue
+            o = a["origin"][2] if "origin" in a else (0.0, 0.0, 0.0)
+            me = els[md[2]]["attrs"]
+            mats = me.get("materials", (0, 0, []))[2]
+            fd, vd = me.get("faceData"), me.get("vertexData")
+            if not fd or not vd:
+                continue
+            st = {els[i]["name"].split(":")[0]: els[i] for i in els[fd[2]]["attrs"].get("streams", (0, 0, []))[2] if isinstance(i, int)}
+            if not all(k in st for k in ("textureScale", "textureAxisU", "textureAxisV", "materialindex")):
+                continue
+            pos = None
+            for si in els[vd[2]]["attrs"].get("streams", (0, 0, []))[2]:
+                if isinstance(si, int) and els[si]["name"].lower().startswith("position"):
+                    pos = els[si]["attrs"]["data"][2]
+            if not pos:
+                continue
+            evi, nxt, vdi = me["edgeVertexIndices"][2], me["edgeNextIndices"][2], me["vertexDataIndices"][2]
+            scs, us, vs_, mis = (st[k]["attrs"]["data"][2] for k in ("textureScale", "textureAxisU", "textureAxisV", "materialindex"))
+            owner, p_ = "world", par.get(ei)
+            while p_ is not None:
+                if els[p_]["type"] == "CMapEntity":
+                    owner = "entity:" + str(els[p_]["attrs"]["classname"][2]) if "classname" in els[p_]["attrs"] else "entity"
+                    break
+                p_ = par.get(p_)
+            for f, he in enumerate(me["faceEdgeIndices"][2]):
+                if f >= len(scs) or not (0 <= mis[f] < len(mats)):
+                    continue
+                sc = scs[f]
+                if not (min(abs(sc[0]), abs(sc[1])) < 0.01 or max(abs(sc[0]), abs(sc[1])) > 8):
+                    continue
+                mat = mats[mis[f]].replace("\\", "/").lower()
+                if mat.startswith("materials/tools/"):
+                    continue
+                pts, h = [], he
+                for _ in range(64):
+                    pts.append([pos[vdi[evi[h]]][k] + o[k] for k in range(3)])
+                    h = nxt[h]
+                    if h == he:
+                        break
+                cen = [sum(q[j] for q in pts) / len(pts) for j in range(3)]
+                key = mat[len("materials/"):-5] if mat.startswith("materials/") and mat.endswith(".vmat") else mat
+                rows.append((key, owner, cen, tuple(sc), (us[f][3], vs_[f][3])))
+    if not rows:
+        return ["# no brush faces with an out-of-range texture scale remain"]
+    permat = collections.defaultdict(list)
+    for r in rows:
+        permat[r[0]].append(r)
+    legit_total = 0
+    summary, perface = [], []
+    for key, rs in sorted(permat.items(), key=lambda kv: -len(kv[1])):
+        vsd = bymat.get(key, [])
+        vsc = collections.Counter((round(sd["us"], 4), round(sd["vs"], 4)) for sd in vsd)
+        info = ""
+        try:
+            vp_, _r = find_in_source1(key + ".vmt")
+            if vp_:
+                dd = parse_vmt(Path(vp_))
+                vtf = resolve_vtf(dd["basetexture"]) if dd.get("basetexture") else None
+                hd = parse_vtf_header(vtf) if vtf else None
+                info = f"vmt {os.path.relpath(vp_, SOURCE1_ROOTS[0]) if SOURCE1_ROOTS and str(vp_).startswith(SOURCE1_ROOTS[0]) else vp_}; $basetexture {dd.get('basetexture')}" + (f" ({hd['width']}x{hd['height']})" if hd else "")
+            else:
+                info = "no .vmt found in the Source1 folders"
+        except Exception:
+            info = "vmt lookup failed"
+        nlegit = 0
+        for r in rs:
+            legit = any(abs(r[3][0] - a_) <= 0.01 * max(abs(a_), 1e-6) + 1e-4 and abs(r[3][1] - b_) <= 0.01 * max(abs(b_), 1e-6) + 1e-4 for (a_, b_) in vsc)
+            nlegit += legit
+            perface.append(f"{'SAME AS .VMF' if legit else 'BROKEN'}\t{key}\t{r[1]}\t{r[2][0]:.0f} {r[2][1]:.0f} {r[2][2]:.0f}\t{r[3][0]:.5g} x {r[3][1]:.5g}\tshift {r[4][0]:.1f} {r[4][1]:.1f}")
+        legit_total += nlegit
+        nbad = len(rs) - nlegit
+        dom = vsc.most_common(1)[0] if vsc else None
+        if nbad == 0:
+            verdict = "all faces use a scale the .vmf also has for this material: legitimate, not broken"
+        elif dom and dom[1] >= 0.9 * len(vsd):
+            verdict = f"{nbad} broken; every .vmf side of this material uses {dom[0][0]:g} x {dom[0][1]:g}, so that is what they should be"
+        elif dom:
+            verdict = f"{nbad} broken; the .vmf uses {', '.join(f'{a_:g}x{b_:g} ({n})' for (a_, b_), n in vsc.most_common(3))} for this material (no single answer)"
+        else:
+            verdict = f"{nbad} broken; material not in the .vmf"
+        sample = min((r for r in rs), key=lambda r: min(abs(r[3][0]), abs(r[3][1])))
+        summary.append(f"{len(rs)}\t{key}\t{verdict}\tvmap scale e.g. {sample[3][0]:.5g} x {sample[3][1]:.5g}\t{info}")
+    lines.append(f"# {len(rows)} brush faces still have a texture scale below 0.01 or above 8 (tools/ materials excluded): {legit_total} equal a scale the .vmf also uses for that material (legitimate), {len(rows) - legit_total} look broken.")
+    lines.append("# Per material: faces, material, verdict from the .vmf scales of that material, an example vmap scale, the Source1 .vmt and texture size")
+    lines += summary
+    lines.append("")
+    lines.append("# Every face: verdict, material, owner (world / entity classname), centre x y z, vmap scale, vmap shift")
+    lines += perface
     return lines
 
 def find_same_name_elsewhere(missing, per_asset=3):
@@ -3447,6 +4225,825 @@ def find_same_name_elsewhere(missing, per_asset=3):
                     if st in want:
                         add(st, "Source1", os.path.relpath(os.path.join(dp, f), root).replace("\\", "/"))
     return found
+
+# ---- static overlays that sit on brush ENTITIES -> parented translucent quads (CS2 static overlays do not project onto entities) ----
+
+class _DmxEl:
+    __slots__ = ("type", "name", "guid", "attrs")
+    def __init__(self, type_, name, guid):
+        self.type, self.name, self.guid, self.attrs = type_, name, guid, []
+    def attr(self, name):
+        for a_ in self.attrs:
+            if a_[0] == name:
+                return a_
+        return None
+    def get(self, name, default=None):
+        a_ = self.attr(name)
+        return default if a_ is None else a_[2]
+    def set(self, name, t, v):
+        a_ = self.attr(name)
+        if a_:
+            a_[1], a_[2] = t, v
+        else:
+            self.attrs.append([name, t, v])
+
+_DMX_FMT = {2: "<i", 3: "<f", 4: "<B", 7: "<i", 8: "<4B", 9: "<2f", 10: "<3f", 11: "<4f", 12: "<3f", 13: "<4f", 14: "<16f", 15: "<Q", 16: "<B"}
+
+class _DmxDoc:
+    """Binary DMX 9 (CS2 .vmap) reader/writer. load()+save() reproduces the original bytes (checked on the jacs / goldeneye /
+    tomgreens maps). Element references are objects; new strings are appended to the string table; element order is kept."""
+    def __init__(self, data: bytes):
+        d = data
+        self.head = d[:d.index(b"\n") + 2]
+        pos = len(self.head)
+        u32 = lambda p_: struct.unpack_from("<I", d, p_)[0]           # noqa: E731
+        def cstr(p_):
+            e_ = d.index(b"\0", p_)
+            return d[p_:e_].decode("utf-8", "surrogateescape"), e_ + 1
+        def skip(bt, p_):
+            if bt == 5:
+                return cstr(p_)[1]
+            if bt == 6:
+                return p_ + 4 + u32(p_)
+            return p_ + struct.calcsize(_DMX_FMT[bt]) if bt != 1 else p_ + 4
+        p0 = pos
+        npre = u32(pos); pos += 4
+        for _ in range(npre):
+            na = u32(pos); pos += 4
+            for _ in range(na):
+                _n, pos = cstr(pos)
+                t = d[pos]; pos += 1
+                if t >= 32:
+                    c = u32(pos); pos += 4
+                    for _ in range(c):
+                        pos = skip(t - 32, pos)
+                else:
+                    pos = skip(t, pos)
+        self.prefix = d[p0:pos]
+        nstr = u32(pos); pos += 4
+        self.strings = []
+        for _ in range(nstr):
+            s_, pos = cstr(pos)
+            self.strings.append(s_)
+        nel = u32(pos); pos += 4
+        self.els = []
+        for _ in range(nel):
+            ti, ni = struct.unpack_from("<ii", d, pos)
+            self.els.append(_DmxEl(self.strings[ti], self.strings[ni] if ni >= 0 else "", d[pos + 8:pos + 24]))
+            pos += 24
+        for e in self.els:
+            na = u32(pos); pos += 4
+            for _ in range(na):
+                name = self.strings[u32(pos)]; pos += 4
+                t = d[pos]; pos += 1
+                arr = t >= 32
+                bt = t - 32 if arr else t
+                def one(p_, inline):
+                    if bt == 1:
+                        i_ = struct.unpack_from("<i", d, p_)[0]
+                        return (self.els[i_] if i_ >= 0 else None), p_ + 4
+                    if bt == 5:
+                        if inline:
+                            return cstr(p_)
+                        return self.strings[u32(p_)], p_ + 4
+                    if bt == 6:
+                        n_ = u32(p_)
+                        return d[p_ + 4:p_ + 4 + n_], p_ + 4 + n_
+                    f_ = _DMX_FMT[bt]
+                    v_ = struct.unpack_from(f_, d, p_)
+                    return (v_[0] if len(v_) == 1 else v_), p_ + struct.calcsize(f_)
+                if arr:
+                    c = u32(pos); pos += 4
+                    v = []
+                    for _ in range(c):
+                        x, pos = one(pos, True)
+                        v.append(x)
+                else:
+                    v, pos = one(pos, False)
+                e.attrs.append([name, t, v])
+        if pos != len(d):
+            raise ValueError(f"DMX parse ended at {pos} of {len(d)} bytes")
+        self.root = self.els[0]
+
+    def reachable(self):
+        seen, st = set(), [self.root]
+        while st:
+            e = st.pop()
+            if e is None or id(e) in seen:
+                continue
+            seen.add(id(e))
+            for _n, t, v in e.attrs:
+                if t == 1:
+                    st.append(v)
+                elif t == 33:
+                    st.extend(v)
+        return seen
+
+    def save_bytes(self) -> bytes:
+        idx = {id(e): i_ for i_, e in enumerate(self.els)}
+        sidx = {s_: i_ for i_, s_ in enumerate(self.strings)}
+        strings = list(self.strings)
+        def S(s_):
+            if s_ not in sidx:
+                sidx[s_] = len(strings); strings.append(s_)
+            return sidx[s_]
+        for e in self.els:
+            S(e.type); S(e.name)
+            for n_, t, v in e.attrs:
+                S(n_)
+                if t == 5:
+                    S(v)
+        def enc(t, v, inline):
+            if t & 32:
+                return struct.pack("<I", len(v)) + b"".join(enc(t - 32, x, True) for x in v)
+            if t == 1:
+                return struct.pack("<i", -1 if v is None else idx[id(v)])
+            if t == 5:
+                return v.encode("utf-8", "surrogateescape") + b"\0" if inline else struct.pack("<I", sidx[v])
+            if t == 6:
+                return struct.pack("<I", len(v)) + v
+            f_ = _DMX_FMT[t]
+            return struct.pack(f_, *(v if isinstance(v, (tuple, list)) else (v,)))
+        out = bytearray(self.head) + self.prefix + struct.pack("<I", len(strings))
+        for s_ in strings:
+            out += s_.encode("utf-8", "surrogateescape") + b"\0"
+        out += struct.pack("<I", len(self.els))
+        for e in self.els:
+            out += struct.pack("<ii", sidx[e.type], sidx[e.name]) + e.guid
+        for e in self.els:
+            out += struct.pack("<I", len(e.attrs))
+            for n_, t, v in e.attrs:
+                out += struct.pack("<I", sidx[n_]) + bytes([t]) + enc(t, v, False)
+        return bytes(out)
+
+def _dmx_clone(e, memo):
+    if e is None:
+        return None
+    if id(e) in memo:
+        return memo[id(e)]
+    n = _DmxEl(e.type, e.name, bytes(random.getrandbits(8) for _ in range(16)))
+    memo[id(e)] = n
+    for name, t, v in e.attrs:
+        if t == 1:
+            v = _dmx_clone(v, memo)
+        elif t == 33:
+            v = [_dmx_clone(x, memo) for x in v]
+        elif isinstance(v, list):
+            v = list(v)
+        n.attrs.append([name, t, v])
+    return n
+
+def _qrot(ang, v):
+    """Source/CS2 pitch-yaw-roll rotation of v (roll about X, then pitch about Y, then yaw about Z)."""
+    p, y, r = (math.radians(x) for x in ang)
+    x, yv, z = v
+    cr, sr = math.cos(r), math.sin(r); yv, z = yv * cr - z * sr, yv * sr + z * cr
+    cp, sp = math.cos(p), math.sin(p); x, z = x * cp + z * sp, -x * sp + z * cp
+    cy, sy = math.cos(y), math.sin(y); x, yv = x * cy - yv * sy, x * sy + yv * cy
+    return (x, yv, z)
+
+def _node_world(node, pts, parent_of):
+    """node origin/angles/scales applied to local points, then the transforms of the CMapGroup(s) it sits in. Children of a
+    brush ENTITY are stored in world space (their own origin is already the world position), so an entity's transform is not applied."""
+    def one(nd, ps):
+        o, a, s = nd.get("origin") or (0, 0, 0), nd.get("angles") or (0, 0, 0), nd.get("scales") or (1, 1, 1)
+        return [tuple(c + o[i] for i, c in enumerate(_qrot(a, (v[0] * s[0], v[1] * s[1], v[2] * s[2])))) for v in ps]
+    pts = one(node, pts)
+    p = parent_of.get(id(node))
+    while p is not None and p.type == "CMapGroup":
+        pts = one(p, pts)
+        p = parent_of.get(id(p))
+    return pts
+
+def _mesh_polys(mesh):
+    """-> [(local polygon [(x,y,z)], material path)] for a CMapMesh element."""
+    md = mesh.get("meshData")
+    if md is None:
+        return []
+    pos = None
+    for s_ in md.get("vertexData").get("streams"):
+        if s_.name.startswith("position"):
+            pos = s_.get("data")
+    mats = md.get("materials") or []
+    mi = None
+    fd = md.get("faceData")
+    if fd is not None:
+        for s_ in fd.get("streams"):
+            if s_.name.startswith("materialindex"):
+                mi = s_.get("data")
+    fe, nx, ev, vdi = md.get("faceEdgeIndices"), md.get("edgeNextIndices"), md.get("edgeVertexIndices"), md.get("vertexDataIndices")
+    fdi = md.get("faceDataIndices")
+    out = []
+    if pos is None or fe is None or nx is None or ev is None or vdi is None:
+        return out
+    for f, he0 in enumerate(fe):
+        poly, he = [], he0
+        for _ in range(64):
+            poly.append(pos[vdi[ev[he]]])
+            he = nx[he]
+            if he == he0:
+                break
+        fi = fdi[f] if fdi and f < len(fdi) and fdi[f] >= 0 else f
+        m_ = mats[mi[fi]] if mi and 0 <= fi < len(mi) and 0 <= mi[fi] < len(mats) else (mats[0] if mats else "")
+        if len(poly) >= 3:
+            out.append((poly, str(m_).replace("\\", "/").lower()))
+    return out
+
+def _poly_normal(pts):
+    nx = ny = nz = 0.0
+    for i, p in enumerate(pts):
+        q = pts[(i + 1) % len(pts)]
+        nx += (p[1] - q[1]) * (p[2] + q[2]); ny += (p[2] - q[2]) * (p[0] + q[0]); nz += (p[0] - q[0]) * (p[1] + q[1])
+    l_ = math.sqrt(nx * nx + ny * ny + nz * nz)
+    return (nx / l_, ny / l_, nz / l_) if l_ > 1e-9 else None
+
+def _overlap_2d(rect, poly, eps=0.5):
+    """rect = (x0, y0, x1, y1), poly = convex [(x, y)] -> True when they overlap by more than eps on every separating axis."""
+    axes = [(1.0, 0.0), (0.0, 1.0)]
+    for i, p in enumerate(poly):
+        q = poly[(i + 1) % len(poly)]
+        ex, ey = q[0] - p[0], q[1] - p[1]
+        l_ = math.hypot(ex, ey)
+        if l_ > 1e-9:
+            axes.append((-ey / l_, ex / l_))
+    rc = [(rect[0], rect[1]), (rect[2], rect[1]), (rect[2], rect[3]), (rect[0], rect[3])]
+    for ax in axes:
+        a = [ax[0] * x + ax[1] * y for x, y in rc]
+        b = [ax[0] * x + ax[1] * y for x, y in poly]
+        if min(max(a), max(b)) - max(min(a), min(b)) <= eps:
+            return False
+    return True
+
+def _in_convex(poly, p):
+    sg = 0
+    for i, a in enumerate(poly):
+        b = poly[(i + 1) % len(poly)]
+        c = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+        if abs(c) < 1e-6:
+            continue
+        if sg and (c > 0) != (sg > 0):
+            return False
+        sg = 1 if c > 0 else -1
+    return True
+
+OVERLAY_ONLY_ATTRS = ("projectionTargets", "renderOrder", "disabledInLowQuality", "useBaseNormals", "projectionFar",
+                      "MaterialAdjustmentParamsStruct", "projectOnBackFaces", "backFacingAngle", "projectionMode")
+
+def _lz4_block(src: bytes, out_size: int) -> bytes:
+    dst = bytearray(); i = 0; n = len(src)
+    while i < n:
+        tok = src[i]; i += 1
+        lit = tok >> 4
+        if lit == 15:
+            while True:
+                b = src[i]; i += 1; lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]; i += lit
+        if i >= n:
+            break
+        off = src[i] | (src[i + 1] << 8); i += 2
+        ml = tok & 15
+        if ml == 15:
+            while True:
+                b = src[i]; i += 1; ml += b
+                if b != 255:
+                    break
+        ml += 4
+        st = len(dst) - off
+        if off >= ml:
+            dst += dst[st:st + ml]
+        else:
+            for k in range(ml):
+                dst.append(dst[st + k])
+    return bytes(dst[:out_size])
+
+def decode_vtex_c(data: bytes):
+    """CS2 compiled texture (.vtex_c) -> PIL RGBA image of mip 0. LZ4 / uncompressed mips; DXT1, DXT5, BC4, BC5, BC7, RGBA8888, BGRA8888.
+    Raises ValueError on anything else. Adapted from skink52/cs2mapping create/vtexread.py (MIT), after ValveResourceFormat's Texture.cs."""
+    import io
+    import numpy as np
+    block = {1: 8, 2: 16, 20: 16, 21: 16, 27: 8}
+    def mip_size(fmt, w, h):
+        if fmt in block:
+            return max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * block[fmt]
+        if fmt in (4, 28):
+            return w * h * 4
+        raise ValueError(f"texture format {fmt} not supported")
+    _size, _hv, _ver, boff, bcount = struct.unpack("<IHHII", data[:16])
+    blocks = {}
+    for k in range(bcount):
+        p = 8 + boff + k * 12
+        t, o, sz = struct.unpack_from("<4sII", data, p)
+        blocks[t] = (p + 4 + o, sz)
+    off, sz = blocks[b"DATA"]
+    w, h, depth, fmt, nmip = struct.unpack_from("<HHHBB", data, off + 20)
+    eoff, ecount = struct.unpack_from("<II", data, off + 32)
+    comp, method = None, 0
+    p = off + 32 + eoff
+    for k in range(ecount):
+        t, o, _s = struct.unpack_from("<III", data, p + k * 12)
+        if t == 4:
+            q = p + k * 12 + 4 + o
+            method, moff, mips = struct.unpack_from("<III", data, q)
+            comp = struct.unpack_from("<%di" % mips, data, q + 4 + moff)
+    if method == 2:
+        raise ValueError("zstd-compressed mips not supported")
+    pos = off + sz
+    for j in range(nmip - 1, 0, -1):
+        ms = mip_size(fmt, max(1, w >> j), max(1, h >> j)) * max(1, depth)
+        if comp is not None:
+            ms = min(ms, comp[j])
+        pos += ms
+    full = mip_size(fmt, w, h)
+    raw = _lz4_block(data[pos:pos + comp[0]], full) if comp is not None and comp[0] < full else data[pos:pos + full]
+    if fmt in (4, 28):
+        a = np.frombuffer(raw, np.uint8).reshape(h, w, 4)
+        if fmt == 28:
+            a = a[..., [2, 1, 0, 3]]
+        return Image.fromarray(a.copy(), "RGBA")
+    fourcc = {1: b"DXT1", 2: b"DXT5"}.get(fmt, b"DX10")
+    hdr = struct.pack("<4sI6I44x", b"DDS ", 124, 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000, h, w, len(raw), 0, 1)
+    pf = struct.pack("<II4s5I", 32, 0x4, fourcc, 0, 0, 0, 0, 0)
+    out = hdr + pf + struct.pack("<5I", 0x1000, 0, 0, 0, 0)
+    if fourcc == b"DX10":
+        out += struct.pack("<5I", {20: 98, 21: 83, 27: 80}[fmt], 3, 0, 1, 0)
+    return Image.open(io.BytesIO(out + raw)).convert("RGBA")
+
+def _cs2_overlay_textures(mat: str):
+    """Overlay material shipped with CS2 (not in the addon): the compiled .vmat_c lists the textures it uses as plain strings
+    (external reference table). -> (color .vtex, translucency .vtex or None, [every .vtex found]) or None when CS2 / the material
+    cannot be read. Paths come back without '_c'."""
+    try:
+        v = cs2_vpk()
+        if not v.loaded:
+            return None
+        base = mat.replace("\\", "/").lower()
+        data = v.read((base if base.endswith(".vmat") else base + ".vmat") + "_c")
+        if not data:
+            return None
+        found = []
+        for m_ in re.finditer(rb"materials/[a-z0-9_\-./]+?\.vtex(?:_c)?(?![a-z0-9_])", data, flags=re.I):
+            p_ = m_.group(0).decode("latin-1").lower()
+            p_ = p_[:-2] if p_.endswith("_c") else p_
+            if p_ not in found:
+                found.append(p_)
+        col = next((p_ for p_ in found if "_color" in os.path.basename(p_)), None)
+        tr = next((p_ for p_ in found if "_trans" in os.path.basename(p_)), None)
+        return (col, tr, found) if col else None
+    except Exception:
+        return None
+
+def _safe_write(path: Path, data: bytes):
+    """Write a file in the addon; skip when it already holds exactly this; retry briefly (Hammer / the resource compiler can hold a
+    freshly written content file open). -> None on success, else a reason string."""
+    last = None
+    for attempt in range(6):
+        try:
+            if path.is_file() and path.read_bytes() == data:
+                return None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            return None
+        except OSError as ex:
+            last = ex
+            time.sleep(0.4)
+    return f"cannot write {path} ({last}); Hammer or another program probably has it open - close Hammer and rerun"
+
+def _build_quad_material(mat: str, export_dir: Path):
+    """Quad material for one overlay material (done once per material per run). -> (quad vmat path, colour ref, translucency ref or None,
+    (w, h, 1.0) or None, log note) or a string saying why not."""
+    vm = export_dir / (mat if mat.endswith(".vmat") else mat + ".vmat")
+    txt = vm.read_text(errors="ignore") if vm.is_file() else ""
+    mc = re.search(r'"TextureColor"\s+"([^"]+)"', txt)
+    mt = re.search(r'"TextureTranslucency"\s+"([^"]+)"', txt)
+    src_note, ts = "", _addon_texture_size(mat)
+    qb = (mat[:-5] if mat.endswith(".vmat") else mat) + "_quad"
+    if mc:
+        col_ref, tr_ref = mc.group(1), (mt.group(1) if mt else None)
+    else:
+        # CS2's own overlay material: its textures are compiled .vtex_c in the VPK, and a vmat cannot point at those directly (Hammer
+        # shows the error material), so the colour texture is decoded to a TGA + an alpha mask TGA in the addon, the same way the
+        # Source1 materials are done.
+        cs = _cs2_overlay_textures(mat)
+        if not cs:
+            return ("the overlay material is not in the addon folder and CS2's own copy could not be read (CS2 VPK not loaded, "
+                    "material not in it, or no texture references in it): no texture to build the quad material from")
+        try:
+            vt = cs2_vpk().read(cs[0] + "_c")
+            if not vt:
+                raise ValueError(f"{cs[0]}_c is not in the indexed CS2 files")
+            im = decode_vtex_c(vt)
+        except Exception as ex:
+            return f"CS2's colour texture {cs[0]} could not be decoded ({ex})"
+        import io
+        col_ref = qb + "_color.tga"
+        b_ = io.BytesIO(); im.convert("RGB").save(b_, "TGA")
+        err = _safe_write(export_dir / col_ref, b_.getvalue())
+        tr_ref = None
+        if not err and im.getchannel(3).getextrema()[0] < 255:
+            tr_ref = qb + "_trans.tga"
+            b_ = io.BytesIO(); im.getchannel(3).convert("RGB").save(b_, "TGA")
+            err = _safe_write(export_dir / tr_ref, b_.getvalue())
+        if err:
+            return err
+        ts = (im.size[0], im.size[1], 1.0)
+        src_note = f"; CS2 texture {cs[0]} ({im.size[0]}x{im.size[1]}) decoded to {col_ref}" + (f" + {tr_ref}" if tr_ref else " (fully opaque, no mask)")
+    qmat = qb + ".vmat"
+    err = _safe_write(export_dir / qmat, ("\n".join(['"Layer0"', "{", '    "Shader" "csgo_vertexlitgeneric.vfx"', f'    "TextureColor" "{col_ref}"']
+                                                  + ([f'    "TextureTranslucency" "{tr_ref}"'] if tr_ref else [])
+                                                  + ['    "F_TRANSLUCENT" "1"', '    "F_RENDER_BACKFACES" "1"', "}"]) + "\n").encode("utf-8"))
+    if err:
+        return err
+    return qmat, col_ref, tr_ref, ts, src_note
+
+def convert_entity_overlays(vmap_paths, export_dir: Path, out_dir: str):
+    """CS2 static overlays do not project onto entities (func_breakable, doors, ...). For each CMapStaticOverlay whose projection
+    volume reaches a face of exactly one brush entity (and no world brush face), the overlay is replaced by a translucent quad
+    (CMapMesh, same position/angles/size/uv, laid QUAD_OFFSET above that face) parented to the entity, so it moves with it.
+    Overlays that also touch world brushes, touch two entities, lie on slanted faces or whose material is not in the addon stay overlays.
+    Re-running is safe: converted overlays no longer exist as overlays."""
+    lines, total, mat_cache = [], 0, {}
+    for vp in vmap_paths:
+        try:
+            raw = Path(vp).read_bytes()
+            if b"encoding binary" not in raw[:100]:
+                lines.append(f"# {os.path.basename(str(vp))}: not a binary .vmap; skipped")
+                continue
+            doc = _DmxDoc(raw)
+        except Exception as ex:
+            lines.append(f"# {os.path.basename(str(vp))}: cannot read ({ex}); skipped")
+            continue
+        els = doc.els
+        parent_of = {}
+        for e in els:
+            if e.type in ("CMapEntity", "CMapGroup", "CMapWorld"):
+                for c in e.get("children") or []:
+                    parent_of[id(c)] = e
+        ovs = [e for e in els if e.type == "CMapStaticOverlay" and id(e) in parent_of]
+        if not ovs:
+            continue
+        meshes = []        # (mesh element, owning entity or None, world polygons [(pts, material)], aabb)
+        for e in els:
+            if e.type != "CMapMesh" or id(e) not in parent_of:
+                continue
+            owner = parent_of[id(e)]
+            polys = []
+            for loc, mat in _mesh_polys(e):
+                if mat.startswith("materials/tools/"):
+                    continue
+                polys.append((_node_world(e, loc, parent_of), mat))
+            if not polys:
+                continue
+            allp = [p for pl, _m in polys for p in pl]
+            bb = ([min(p[i] for p in allp) for i in range(3)], [max(p[i] for p in allp) for i in range(3)])
+            meshes.append((e, owner if owner.type == "CMapEntity" else None, polys, bb))
+        next_id = max((e.get("nodeID") or 0) for e in els if e.attr("nodeID")) + 1
+        made, notes = [], []
+        for ov in ovs:
+            md = ov.get("meshData")
+            mats = (md.get("materials") or []) if md is not None else []
+            mat = str(mats[0]).replace("\\", "/").lower() if mats else ""
+            vloc = None
+            for s_ in md.get("vertexData").get("streams"):
+                if s_.name.startswith("position"):
+                    vloc = s_.get("data")
+            if not vloc or len(vloc) != 4:
+                continue
+            ang = ov.get("angles") or (0, 0, 0)
+            ex_, ey_, n_ = _qrot(ang, (1, 0, 0)), _qrot(ang, (0, 1, 0)), _qrot(ang, (0, 0, 1))
+            O = ov.get("origin")
+            pts_w = _node_world(ov, list(vloc), parent_of)
+            loc2 = [(sum((p[i] - O[i]) * ex_[i] for i in range(3)), sum((p[i] - O[i]) * ey_[i] for i in range(3))) for p in pts_w]
+            rect = (min(p[0] for p in loc2), min(p[1] for p in loc2), max(p[0] for p in loc2), max(p[1] for p in loc2))
+            far = ov.get("projectionFar")
+            far = 64.0 if far is None else far
+            lo = [min(min(p[i] for p in pts_w), O[i]) - far - 1 for i in range(3)]
+            hi = [max(max(p[i] for p in pts_w), O[i]) + far + 1 for i in range(3)]
+            hits_e, hits_w, slanted = [], [], 0
+            for m_, own, polys, bb in meshes:
+                if any(bb[1][i] < lo[i] or bb[0][i] > hi[i] for i in range(3)):
+                    continue
+                for pl, pmat in polys:
+                    fn = _poly_normal(pl)
+                    if fn is None:
+                        continue
+                    t = sum((pl[0][i] - O[i]) * n_[i] for i in range(3))
+                    if t < -0.5 or t > far + 0.5:
+                        continue
+                    pl2 = [(sum((p[i] - O[i]) * ex_[i] for i in range(3)), sum((p[i] - O[i]) * ey_[i] for i in range(3))) for p in pl]
+                    if not _overlap_2d(rect, pl2):
+                        continue
+                    d_ = sum(fn[i] * n_[i] for i in range(3))
+                    if d_ > -0.99:
+                        if d_ > -0.7:         # back faces / perpendicular faces are not projected on
+                            continue
+                        slanted += 1
+                        continue
+                    (hits_e if own is not None else hits_w).append((t, own, pl2, m_))
+            nid = ov.get("nodeID")
+            where = "origin %.1f %.1f %.1f" % tuple(O)
+            if not hits_e and not slanted:
+                continue
+            if not hits_e:
+                notes.append(f"LEFT\tnode {nid}\t{mat}\t{where}\tonly slanted entity face(s) under it ({slanted}); the quad would not lie flat")
+                continue
+            if hits_w:
+                notes.append(f"LEFT\tnode {nid}\t{mat}\t{where}\ttouches {len(hits_w)} world brush face(s) as well as an entity: a quad would cover only part of it")
+                continue
+            hits_e.sort(key=lambda h: h[0])
+            best = hits_e[0]
+            if any(h[1] is not best[1] and h[0] - best[0] <= 0.5 for h in hits_e):
+                notes.append(f"LEFT\tnode {nid}\t{mat}\t{where}\ttouches faces of two different entities at the same depth")
+                continue
+            ent = best[1]
+            pr = ent.get("entity_properties")
+            props = {a_[0]: a_[2] for a_ in pr.attrs if a_[1] == 5} if pr is not None else {}
+            who = f"{props.get('classname', '?')} '{props.get('targetname', '')}'"
+            qm_ = mat_cache.get(mat)
+            if qm_ is None:
+                qm_ = mat_cache[mat] = _build_quad_material(mat, Path(export_dir))
+            if isinstance(qm_, str):
+                notes.append(f"LEFT\tnode {nid}\t{mat}\t{where}\ton {who}; {qm_}")
+                continue
+            qmat, col_ref, tr_ref, ts, src_note = qm_
+            tw, th = (ts[0], ts[1]) if ts else (256.0, 256.0)
+            # texcoords per vertex of the overlay's single face -> axes / scale / shift in the mesh's local space
+            tc = None
+            for s_ in md.get("faceVertexData").get("streams"):
+                if s_.name.startswith("texcoord"):
+                    tc = s_.get("data")
+            fe, nx, evx, vdi, evd = md.get("faceEdgeIndices"), md.get("edgeNextIndices"), md.get("edgeVertexIndices"), md.get("vertexDataIndices"), md.get("edgeVertexDataIndices")
+            vt, he = {}, fe[0]
+            for _ in range(4):
+                vt[vdi[evx[he]]] = tc[evd[he]]
+                he = nx[he]
+            ok_uv = len(vt) == 4 and all(k in vt for k in range(4))
+            axes = None
+            if ok_uv:
+                x0, y0, x1, y1, x3, y3 = vloc[0][0], vloc[0][1], vloc[1][0], vloc[1][1], vloc[3][0], vloc[3][1]
+                det = (x1 - x0) * (y3 - y0) - (y1 - y0) * (x3 - x0)
+                if abs(det) > 1e-6:
+                    sol = []
+                    for k in (0, 1):
+                        du, dv = vt[1][k] - vt[0][k], vt[3][k] - vt[0][k]
+                        gx = (du * (y3 - y0) - (y1 - y0) * dv) / det
+                        gy = ((x1 - x0) * dv - du * (x3 - x0)) / det
+                        c = vt[0][k] - gx * x0 - gy * y0
+                        err = max(abs(gx * v[0] + gy * v[1] + c - vt[i_][k]) for i_, v in enumerate(vloc))
+                        gl = math.hypot(gx, gy)
+                        if err > 1e-3 or gl < 1e-9:
+                            sol = None
+                            break
+                        tex = tw if k == 0 else th
+                        sol.append(((gx / gl, gy / gl, 0.0, c * tex), 1.0 / (gl * tex)))
+                    axes = sol
+            q = _dmx_clone(ov, {})
+            q.type = "CMapMesh"
+            q.attrs = [a_ for a_ in q.attrs if a_[0] not in OVERLAY_ONLY_ATTRS]
+            q.set("nodeID", 2, next_id); next_id += 1
+            q.set("referenceID", 15, random.getrandbits(64))
+            q.set("randomSeed", 2, random.getrandbits(31))
+            t_face = best[0]
+            q.set("origin", 10, tuple(float(O[i] + n_[i] * (t_face - OVERLAY_QUAD_OFFSET)) for i in range(3)))
+            qm = q.get("meshData")
+            qm.set("materials", 37, [qmat])
+            if axes:
+                for s_ in qm.get("faceData").get("streams"):
+                    if s_.name.startswith("textureScale"):
+                        s_.set("data", s_.attr("data")[1], [(axes[0][1], axes[1][1])])
+                    elif s_.name.startswith("textureAxisU"):
+                        s_.set("data", s_.attr("data")[1], [axes[0][0]])
+                    elif s_.name.startswith("textureAxisV"):
+                        s_.set("data", s_.attr("data")[1], [axes[1][0]])
+            doc.els.append(q)
+            made.append((ov, q, ent))
+            notes.append(f"CONVERTED\tnode {nid} -> {q.get('nodeID')}\t{mat}\t{where}\tquad on {who}, {t_face - OVERLAY_QUAD_OFFSET:.2f} units from the overlay plane"
+                         + ("" if ts else "; texture size unknown (256 assumed for the uv axes)") + ("" if axes else "; uv axes left as the overlay's")
+                         + ("" if tr_ref else "; no translucency mask for this decal") + src_note)
+        if made:
+            for ov, q, ent in made:
+                par = parent_of[id(ov)]
+                par.attr("children")[2] = [c for c in par.get("children") if c is not ov]
+                ent.attr("children")[2] = list(ent.get("children") or []) + [q]
+            # new sub-elements of the quads must be in the element list too; dropped overlays' private sub-elements are removed
+            seen_ids = {id(e) for e in doc.els}
+            st = [q for _o, q, _e in made]
+            while st:
+                e = st.pop()
+                for _n, t, v in e.attrs:
+                    for x in ([v] if t == 1 else v if t == 33 else []):
+                        if x is not None and id(x) not in seen_ids:
+                            seen_ids.add(id(x)); doc.els.append(x); st.append(x)
+            after = doc.reachable()
+            dead = set()
+            for ov, _q, _e in made:
+                st = [ov]
+                while st:
+                    e = st.pop()
+                    if id(e) in dead or id(e) in after:
+                        continue
+                    dead.add(id(e))
+                    for _n, t, v in e.attrs:
+                        for x in ([v] if t == 1 else v if t == 33 else []):
+                            if x is not None:
+                                st.append(x)
+            doc.els = [e for e in doc.els if id(e) not in dead]
+            data = doc.save_bytes()
+            try:
+                chk = read_binary_dmx(data)
+                assert sum(1 for e in chk if e["type"] == "CMapStaticOverlay") == len(ovs) - len(made)
+            except Exception as ex:
+                notes.append(f"# {os.path.basename(str(vp))}: the edited file failed its re-read check ({ex}); NOT written")
+                made = []
+            if made:
+                bak = os.path.join(out_dir, os.path.basename(str(vp)) + ".before_overlayquads")
+                try:
+                    shutil.copy2(vp, bak)
+                    Path(vp).write_bytes(data)
+                except OSError as ex:
+                    notes.append(f"# {os.path.basename(str(vp))}: could not write the map ({ex}); nothing was changed in it. Close Hammer and rerun.")
+                    print(f"  [WARN] overlay quads: could not write {vp} ({ex}); close Hammer and rerun")
+                    made = []
+            if made:
+                notes.append(f"# {len(made)} overlay(s) converted to parented quads in {vp}; original saved as {bak}. Reopen the map in Hammer.")
+                print(f"  overlay quads: converted {len(made)} of {len(ovs)} static overlays in {os.path.basename(str(vp))} (backup {bak})")
+                total += len(made)
+        if notes:
+            lines.append(f"# {os.path.basename(str(vp))}: {len(ovs)} static overlay(s); LEFT = stays a static overlay (reason given)")
+            lines += notes
+    return [f"# {total} static overlay(s) converted to quads parented to brush entities (CS2 static overlays do not project onto entities)"] + lines
+
+
+# ---- report: entity outputs (IO connections) that are in the .vmf but not in the .vmap. READ-ONLY: nothing is changed ----
+
+_IO_SPECIAL = ("!activator", "!caller", "!self", "!player", "!picker", "!pvsplayer", "!enemy", "!target")
+
+def _vmf_entities_io(path: str):
+    """-> [{"cls","name","origin" (tuple or None),"bbox" ((lo),(hi)) or None,"conns":[(output,target,input,param,delay,times)]}]
+    Keeps repeated output names (a plain dict would collapse them). Connection values are 'target,input,param,delay,times' with ','
+    or ESC (0x1b) between the fields."""
+    ents, depth, cur, sect, pending = [], 0, None, None, ""
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        ln = raw.strip()
+        if ln == "{":
+            depth += 1
+            if depth == 1 and pending == "entity":
+                cur = {"cls": "", "name": "", "origin": None, "pts": [], "conns": []}
+            elif cur is not None and depth == 2:
+                sect = pending
+            continue
+        if ln == "}":
+            if cur is not None and depth == 2:
+                sect = None
+            if depth == 1 and cur is not None:
+                pts = cur.pop("pts")
+                cur["bbox"] = ([min(p[i] for p in pts) for i in range(3)], [max(p[i] for p in pts) for i in range(3)]) if pts else None
+                ents.append(cur)
+                cur = None
+            depth -= 1
+            continue
+        if ln.startswith('"'):
+            m = re.match(r'"([^"]*)"\s+"(.*)"\s*$', ln)
+            if not m or cur is None:
+                continue
+            k, v = m.group(1), m.group(2)
+            if depth == 1:
+                kl = k.lower()
+                if kl == "classname":
+                    cur["cls"] = v.lower()
+                elif kl == "targetname":
+                    cur["name"] = v
+                elif kl == "origin":
+                    try:
+                        cur["origin"] = tuple(float(x) for x in v.split()[:3])
+                    except ValueError:
+                        pass
+            elif depth == 2 and sect == "connections":
+                esc = "\x1b" in v
+                f = v.split("\x1b") if esc else v.split(",")
+                if len(f) >= 5:
+                    try:
+                        cur["conns"].append((k, f[0], f[1], f[2] if esc else ",".join(f[2:-2]), float(f[-2]), int(float(f[-1]))))
+                    except ValueError:
+                        pass
+            elif depth == 3 and sect == "solid" and k.lower() == "plane":
+                for t in re.findall(r"\(([^)]*)\)", v):
+                    try:
+                        cur["pts"].append(tuple(float(x) for x in t.split()))
+                    except ValueError:
+                        pass
+            continue
+        if ln:
+            pending = ln
+    return ents
+
+def _vmap_entities_io(path: str):
+    doc = _DmxDoc(Path(path).read_bytes())
+    parent_of = {}
+    for e in doc.els:
+        if e.type in ("CMapEntity", "CMapGroup", "CMapWorld"):
+            for c in e.get("children") or []:
+                parent_of[id(c)] = e
+    out = []
+    for e in doc.els:
+        if e.type != "CMapEntity":
+            continue
+        pr = e.get("entity_properties")
+        props = {a_[0]: a_[2] for a_ in pr.attrs if a_[1] == 5} if pr is not None else {}
+        pts = []
+        for k in e.get("children") or []:
+            if k.type == "CMapMesh":
+                for loc, _m in _mesh_polys(k):
+                    pts += _node_world(k, loc, parent_of)
+        bbox = ([min(p[i] for p in pts) for i in range(3)], [max(p[i] for p in pts) for i in range(3)]) if pts else None
+        conns = []
+        for c in e.get("connectionsData") or []:
+            conns.append((c.get("outputName") or "", c.get("targetName") or "", c.get("inputName") or "", c.get("overrideParam") or "",
+                          float(c.get("delay") or 0.0), int(c.get("timesToFire") if c.get("timesToFire") is not None else -1)))
+        out.append({"cls": (props.get("classname") or "").lower(), "name": props.get("targetname") or "",
+                    "origin": tuple(e.get("origin") or (0, 0, 0)), "bbox": bbox, "conns": conns, "used": False})
+    return out
+
+def report_dropped_io(vmap_paths, vmf_path: str):
+    """Compare every entity output in the .vmf with the .vmap's. -> report lines. Changes nothing.
+    Owners are matched by name (+ classname), unnamed ones by classname and position / brush bounds. A dropped output is flagged by
+    whether its target still exists in the vmap, so outputs of removed / replaced logic (an edited map) are told apart from ones the
+    importer lost."""
+    import fnmatch
+    from collections import Counter
+    if not vmf_path or not Path(vmf_path).is_file():
+        return ["# no .vmf: dropped outputs cannot be listed"]
+    vents = [e for e in _vmf_entities_io(vmf_path) if e["conns"]]
+    nconn = sum(len(e["conns"]) for e in vents)
+    lines = [f"# outputs (IO) in the .vmf that are not in the .vmap. {len(vents)} .vmf entities with outputs, {nconn} outputs. Nothing was changed.",
+             "# OWNER = the entity that fires the output; TARGET = what it fires at. Matching is by name (+classname), or for unnamed owners by classname and position / brush bounds.",
+             "# TARGET EXISTS: an entity with that name (or a matching wildcard / classname) is in the vmap, so the output is probably a real loss.",
+             "# TARGET GONE: nothing in the vmap has that name, so the logic was most likely removed or replaced when the map was edited.",
+             "# TARGET SPECIAL: !activator / !self / ... resolved at run time.  OWNER NOT FOUND: no vmap entity matches the owner, so its outputs cannot be compared (listed once, no judgement).", ""]
+    for vp in vmap_paths:
+        try:
+            ments = _vmap_entities_io(vp)
+        except Exception as ex:
+            lines.append(f"# {os.path.basename(str(vp))}: cannot read ({ex})")
+            continue
+        names = {}
+        for m in ments:
+            if m["name"]:
+                names.setdefault(m["name"].lower(), []).append(m)
+        all_names, all_cls = set(names), {m["cls"] for m in ments}
+        def target_status(t):
+            tl = t.lower()
+            if tl in _IO_SPECIAL:
+                return "TARGET SPECIAL"
+            if tl in all_names or tl in all_cls:
+                return "TARGET EXISTS"
+            if any(c in tl for c in "*?") and (any(fnmatch.fnmatchcase(n, tl) for n in all_names) or any(fnmatch.fnmatchcase(c, tl) for c in all_cls)):
+                return "TARGET EXISTS"
+            return "TARGET GONE"
+        def dist(v, m):
+            if v["bbox"] and m["bbox"]:
+                cv = [(v["bbox"][0][i] + v["bbox"][1][i]) / 2 for i in range(3)]
+                cm = [(m["bbox"][0][i] + m["bbox"][1][i]) / 2 for i in range(3)]
+                sz = max(abs((v["bbox"][1][i] - v["bbox"][0][i]) - (m["bbox"][1][i] - m["bbox"][0][i])) for i in range(3))
+                return math.dist(cv, cm) + (1e6 if sz > 4.0 else 0.0)
+            if v["origin"] and not v["bbox"] and not m["bbox"]:
+                return math.dist(v["origin"], m["origin"])
+            return 1e9
+        dropped, notfound, matched = [], [], 0
+        for v in vents:
+            cand = [m for m in ments if m["cls"] == v["cls"] and not m["used"]]
+            if v["name"]:
+                cand = [m for m in cand if m["name"].lower() == v["name"].lower()]
+            else:
+                cand = [m for m in cand if not m["name"]]
+            best = min(cand, key=lambda m: dist(v, m), default=None)
+            if best is None or (not v["name"] and dist(v, best) > (3.0 if v["bbox"] else 1.0)):
+                notfound.append(v)
+                continue
+            best["used"] = True
+            matched += 1
+            miss = Counter((o.lower(), t.lower(), i.lower(), p, round(d, 3), n) for o, t, i, p, d, n in v["conns"])
+            miss.subtract(Counter((o.lower(), t.lower(), i.lower(), p, round(d, 3), n) for o, t, i, p, d, n in best["conns"]))
+            for (o, t, i, p, d, n), c in miss.items():
+                for _ in range(max(c, 0)):
+                    dropped.append((v, o, t, i, p, d, n))
+        stats = Counter(target_status(t) for _v, _o, t, _i, _p, _d, _n in dropped)
+        lines.append(f"# {os.path.basename(str(vp))}: owners matched {matched} of {len(vents)}; outputs dropped from matched owners: {len(dropped)} "
+                     f"({stats['TARGET EXISTS']} target exists, {stats['TARGET GONE']} target gone, {stats['TARGET SPECIAL']} special); "
+                     f"owners not found {len(notfound)} ({sum(len(v['conns']) for v in notfound)} outputs not compared)")
+        by = Counter((o, i) for _v, o, _t, i, _p, _d, _n in dropped if target_status(_t) == "TARGET EXISTS")
+        if by:
+            lines.append("# probable losses by output -> input (target still exists): " + ", ".join(f"{o}->{i} x{c}" for (o, i), c in by.most_common(12)))
+        order = {"TARGET EXISTS": 0, "TARGET SPECIAL": 1, "TARGET GONE": 2}
+        for v, o, t, i, p, d, n in sorted(dropped, key=lambda r: (order[target_status(r[2])], r[0]["cls"], r[0]["name"].lower(), r[1])):
+            who = f"{v['cls']} '{v['name']}'" if v["name"] else f"{v['cls']} (unnamed, {' '.join(str(round(x)) for x in (v['origin'] or [(a + b) / 2 for a, b in zip(*v['bbox'])]))})"
+            lines.append(f"{target_status(t)}\t{who}\t{o}\t-> {t}\t{i}\t{p!r}\tdelay {d:g}\ttimes {n}")
+        for v in notfound[:400]:
+            who = f"{v['cls']} '{v['name']}'" if v["name"] else f"{v['cls']} (unnamed, {' '.join(str(round(x)) for x in (v['origin'] or [(a + b) / 2 for a, b in zip(*v['bbox'])]))})"
+            lines.append(f"OWNER NOT FOUND\t{who}\t{len(v['conns'])} output(s): " + "; ".join(sorted({f"{o}->{t}.{i}" for o, t, i, _p, _d, _n in v['conns']}))[:200])
+        lines.append("")
+    return lines
 
 def find_overlay_vmf(vmap_paths):
     """STATIC_OVERLAY_VMF if set; otherwise the .vmf under <Source1 root>/maps (or <root>/*/maps) whose name is most like a scanned vmap's."""
@@ -3863,7 +5460,7 @@ def find_asset(asset_rel_path: str):
 
 # ======================================================================== MAIN
 
-SCRIPT_VERSION = "2026-10-26zk cleanup"
+SCRIPT_VERSION = "2026-10-29g 2.8 8-bit wav fallback"
 
 def main():
     global EXPORT_DIR
@@ -4012,7 +5609,7 @@ def main():
                 verified_only.add(asset)
 
             elif kind == "source1_vmt":
-                vmat_rel = os.path.splitext(asset)[0] + ".vmat"
+                vmat_rel = (os.path.splitext(asset)[0] + ".vmat").replace("+", "_")
                 if exists_out(vmat_rel) and not OVERWRITE_EXISTING_VMATS:
                     ok, info = True, "kept existing"
                 else:
@@ -4253,10 +5850,16 @@ def main():
         Path(log("cs2_stub_materials")).write_text(
             "# CS2 ships these vmats with the error shader and no textures; they were re-ported from Source1 where possible\n"
             + "\n".join(sorted(STUB_CS2_VMATS)), encoding="utf-8")
+    rename_plus_refs(vmaps, LOG_DIR)
     _ov_vmf = find_overlay_vmf(vmaps)
+    globals()["_ADDON_DIR"] = export_dir
     if FACE_SCALE_FIX:
         _fsl = fix_face_scales(vmaps, _ov_vmf, LOG_DIR, in_place=True)
         Path(log("face_scale_fix")).write_text("\n".join(_fsl), encoding="utf-8")
+        _abs = report_absurd_scale_faces(vmaps, _ov_vmf)
+        Path(log("absurd_scales")).write_text("\n".join(_abs), encoding="utf-8")
+        if _abs and _abs[0].startswith("# ") and "still have" in _abs[0]:
+            print("  face scales: " + _abs[0][2:].split(": ")[0] + f"  (details: {Path(log('absurd_scales')).name})")
         if not _ov_vmf:
             print("  [NOTE] face scales: no matching .vmf found, so wrong texture SCALES cannot be fixed (set STATIC_OVERLAY_VMF); texture coordinates were still checked")
     _ov_lines = static_overlay_report(vmaps, export_dir)
@@ -4293,6 +5896,16 @@ def main():
                             "Set STATIC_OVERLAY_VMF (top of the script) to the decompiled .vmf and rerun.")
         print("  [NOTE] static overlays: set STATIC_OVERLAY_VMF to list the angles each overlay needs (the vmap alone cannot tell)")
     Path(log("static_overlays")).write_text("\n".join(_ov_lines), encoding="utf-8")
+    if OVERLAY_ENTITY_QUADS:
+        _oq = convert_entity_overlays(vmaps, export_dir, LOG_DIR)
+        Path(log("overlay_entity_quads")).write_text("\n".join(_oq), encoding="utf-8")
+        print("  overlay quads: " + _oq[0][2:])
+    if REPORT_DROPPED_IO and _ov_vmf:
+        _io = report_dropped_io(vmaps, _ov_vmf)
+        Path(log("dropped_io")).write_text("\n".join(_io), encoding="utf-8")
+        for _l in _io:
+            if _l.startswith("# ") and "owners matched" in _l:
+                print("  dropped IO: " + _l[2:].replace("outputs dropped from matched owners", "outputs dropped") + f"  (details: {Path(log('dropped_io')).name})")
     if GENERATE_STEAM_PARTICLES and cs2_vpk().loaded:
         _kw = ("heat", "distort", "refract", "warp", "haze", "ripple", "wave", "shimmer", "noise", "normal", "smoke_normal", "water")
         _cands = sorted(f for f in cs2_vpk().files if f.startswith("materials/particle/") and f.endswith((".vtex_c", ".vmat_c"))
