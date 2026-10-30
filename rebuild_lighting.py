@@ -2,11 +2,9 @@ r"""Rebuild the lighting of a ported CS2 map (.vmap) from the Source 1 map (.vmf
 
 Valve's importer gets CS:GO lights wrong (brightness comes out as NaN, so Hammer resets it to 1000 lumens, and the
 colour is turned into a 6600 K white).  This script throws away every light, light probe volume and visibility hint in
-the vmap and builds them again from the .vmf, then runs the light probe, stationary light and vis passes on top.  It also
-renames physics props so push_mass.js can read their mass, and splits very large lit faces.
-The probe / stationary light / vis passes are skink52's (github.com/skink52/cs2portdocs, tools/: dmx.py, kv2.py, vmapedit.py,
-lighting.py, visfit.py plus a probe-volume pass, bundled unchanged below; AI-generated, shared by skink52 for the porting knowledge
-in them).  The face splitter (splitfaces, also bundled below) is this script's own.
+the vmap and builds them again from the .vmf, then runs the light probe, stationary light and vis passes on top.
+Those passes are skink52's (github.com/skink52/cs2portdocs, tools/: dmx.py, kv2.py, vmapedit.py, lighting.py, visfit.py plus a
+probe-volume pass, bundled unchanged below; AI-generated, shared by skink52 for the porting knowledge in them).
 
   1. delete       light_omni2, light_barn, light_rect, light_capsule, light_omni, light_ortho, light_spot, light,
                   env_combined_light_probe_volume and visibility_hint (hand-placed ones too)
@@ -23,16 +21,8 @@ in them).  The face splitter (splitfaces, also bundled below) is this script's o
   3. sun          light_environment is kept (the importer's values are right) -- --sun-scale scales its brightness
   4. underwater   Source water is lit by the lightmap, CS2 water volumes need lights: a few dim lights are put inside each
                   func_water / func_water_analog with no light already inside it (--no-underwater to skip)
-  5. props        every prop_physics / prop_physics_override is renamed <name>__pm<mass> for push_mass.js: the mass of the
-                  Source 1 model's .phy x massscale (the .phy is looked for under --source1, the vmf's folder and its parent).
-                  Outputs, point_template slots and keyvalues that named the prop follow the new name; a name shared by props
-                  of different mass becomes one name per mass.  Props you named push_<mass>_... are kept (--skip-props to skip)
-  6. passes       light probe volumes, stationary lights and vis hints (skink52's code, bundled in this file).  The extra lights that pass adds to unlit rooms get the map's median brightness
+  5. passes       light probe volumes, stationary lights and vis hints (skink52's code, bundled in this file).  The extra lights that pass adds to unlit rooms get the map's median brightness
                   (its template light is otherwise a 1000 lumen default)
-  7. large faces  one face is one lightmap chart, so a huge floor can bake blotchy: lit faces over --large-face-area
-                  (default 512 x 512) are cut on a --face-tile grid with T-junctions repaired, and by default every tile becomes
-                  its own mesh so it gets its own cubemap / probe (--split-large-faces faces keeps one mesh, off only reports).
-                  Displacements, rotated or scaled meshes and non-convex faces are not cut; they are listed in the report
 
 Safe by default: writes <map>_rebuilt.vmap next to the original and leaves the original alone.
 Close the map in Hammer first, or Hammer will overwrite the changes when you save.
@@ -45,10 +35,8 @@ Usage:
   py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --in-place            backs up to maps\backups\, then overwrites
   py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --light-scale 0.8      all point / spot lights 20% dimmer
   py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --sun-scale 0.9        sun 10% dimmer
-  py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --skip-passes          only rebuild the lights (props and face splitting still run)
+  py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --skip-passes          only rebuild the lights
   py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --exposure 0.8 1.0     post_processing_volume min / max exposure
-  py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --source1 "C:\...\csgo"     folder holding models\ with the .phy files
-  py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --split-large-faces off      only report large faces, do not cut them
   py rebuild_lighting.py mymap.vmap --restore "maps\backups\mymap.20261029-190000.vmap"    undo
 
 The light scale (1000 lumens per 265 intensity) and the spotlight lumens come from the importer's own output and from the
@@ -250,234 +238,234 @@ def fmt(x):
     return ('%.6f' % x).rstrip('0').rstrip('.') if x != int(x) else '%d' % int(x)
 
 
-# ======================================================================= physics prop names (for push_mass.js)
-PROP_CLASSES = ('prop_physics', 'prop_physics_override')
-MASS_TAG = '__pm'                       # <name>__pm<mass>, a decimal point is written as p (12.5 -> 12p5)
-MANUAL_RE = re.compile(r'^push_\d+(?:\.\d+)?_', re.I)
-TAG_RE = re.compile(re.escape(MASS_TAG) + r'(\d+(?:p\d+)?)$', re.I)
-NO_REF_KEYS = {'targetname', 'classname', 'model', 'message', 'globalname', 'vscripts', 'description', 'origin', 'angles'}
-UNNAMED_BASE = 'physprop'
+                                                                                                               
+                                                        
+                                                                                                          
+                                                     
+                                                                   
+                                                                                                                          
+                         
 
 
-def mass_text(x):
-    r = round(x, 1)
-    return ('%d' % r) if r == int(r) else ('%.1f' % r).replace('.', 'p')
+                 
+                   
+                                                                        
 
 
-def find_ci(root, rel):
-    """rel (forward slashes) under root, matching each folder / file name case-insensitively -> path or None"""
-    cur = root
-    for part in rel.replace('\\', '/').split('/'):
-        if not part:
-            continue
-        nxt = os.path.join(cur, part)
-        if not os.path.exists(nxt):
-            try:
-                hit = next((f for f in os.listdir(cur) if f.lower() == part.lower()), None)
-            except OSError:
-                return None
-            if hit is None:
-                return None
-            nxt = os.path.join(cur, hit)
-        cur = nxt
-    return cur if os.path.isfile(cur) else None
+                       
+                                                                                                               
+              
+                                                  
+                    
+                    
+                                     
+                                   
+                
+                                                                                           
+                           
+                           
+                           
+                           
+                                        
+                 
+                                               
 
 
-def phy_mass(path):
-    """total mass in a Source 1 .phy: the sum of the "mass" of every solid in its trailing keyvalues text"""
-    try:
-        txt = open(path, 'rb').read().decode('latin-1')
-    except OSError:
-        return None
-    vals = re.findall(r'"mass"\s+"([-+0-9.eE]+)"', txt)
-    try:
-        tot = sum(float(v) for v in vals)
-    except ValueError:
-        return None
-    return tot if vals and tot > 0 else None
+                   
+                                                                                                            
+        
+                                                       
+                   
+                   
+                                                       
+        
+                                         
+                      
+                   
+                                            
 
 
-class PropNames:
-    """Rename every prop_physics / prop_physics_override to <name>__pm<mass> (mass from the Source 1 model's .phy x massscale), so
-    push_mass.js can read the mass from the name.  Everything that refers to the old name follows: outputs aimed at it, point_template
-    Template slots, parentname / target and other keyvalues that equal it.  A name shared by props of different masses becomes one
-    name per mass: outputs are copied once per new name and a point_template gets one slot per new name."""
+                
+                                                                                                                                  
+                                                                                                                                      
+                                                                                                                                  
+                                                                                                           
 
-    def __init__(self, rb, roots):
-        self.rb, self.m, self.roots = rb, rb.m, roots
-        self.rep = []                      # report lines
-        self.cache = {}
+                                  
+                                                     
+                                                         
+                       
 
-    def model_mass(self, model):
-        if model in self.cache:
-            return self.cache[model]
-        rel = re.sub(r'\.vmdl(_c)?$', '', model.replace('\\', '/'), flags=re.I) + '.phy'
-        res = None
-        for r in self.roots:
-            f = find_ci(r, rel)
-            if f:
-                res = (phy_mass(f), f)
-                break
-        self.cache[model] = res
-        return res
+                                
+                               
+                                    
+                                                                                        
+                  
+                            
+                               
+                 
+                                      
+                     
+                               
+                  
 
-    def vmf_massscale(self, e):
-        idx = getattr(self, '_vidx', None)
-        if idx is None:
-            idx = self._vidx = {}
-            for ve in self.rb.v:
-                kv = ve['kv']
-                if kv.get('classname', '').lower() in PROP_CLASSES and kv.get('origin'):
-                    try:
-                        o = tuple(round(float(x)) for x in kv['origin'].split()[:3])
-                    except ValueError:
-                        continue
-                    idx.setdefault((o, kv.get('model', '').lower()), kv)
-        o = tuple(round(x) for x in self.m.origin(e))
-        kv = idx.get((o, self.m.P(e, 'model', '').lower().replace('.vmdl', '.mdl')))
-        if kv and kv.get('massscale'):
-            try:
-                return float(kv['massscale'])
-            except ValueError:
-                pass
-        return None
+                               
+                                          
+                       
+                                 
+                                
+                             
+                                                                                        
+                        
+                                                                                    
+                                      
+                                
+                                                                        
+                                                     
+                                                                                    
+                                      
+                
+                                             
+                              
+                    
+                   
 
-    def run(self, keep_manual=True):
-        m, rb = self.m, self.rb
-        props = m.by_class(*PROP_CLASSES)
-        if not props:
-            return
-        plan, nomass, manual, same = {}, {}, [], 0      # node -> (old, new)
-        for e in props:
-            old = m.name(e)
-            model = m.P(e, 'model', '')
-            if old and MANUAL_RE.match(old) and keep_manual:
-                manual.append((old, model))
-                continue
-            got = self.model_mass(model) if model else None
-            if not got or not got[0]:
-                nomass.setdefault(model or '(no model)', []).append(old or '(unnamed)')
-                continue
-            ms = None
-            for k in ('massScale', 'massscale'):
-                v = m.P(e, k, '')
-                if v.strip():
-                    try:
-                        ms = float(v)
-                    except ValueError:
-                        pass
-                    break
-            if ms is None:
-                ms = self.vmf_massscale(e)
-            mass = got[0] * (ms if ms is not None and ms > 0 else 1.0)       # massscale 0 (the FGD default) = no scaling
-            if mass <= 0:
-                nomass.setdefault(model, []).append(old or '(unnamed)')
-                continue
-            base = MANUAL_RE.sub('', TAG_RE.sub('', old)) if old else UNNAMED_BASE
-            base = base or UNNAMED_BASE
-            new = base + MASS_TAG + mass_text(mass)
-            if new == old:
-                same += 1
-                continue
-            plan[e] = (old, new, model, mass)
-        # old name (lower) -> ordered distinct new names
-        name_map = {}
-        for e, (old, new, model, mass) in plan.items():
-            if old:
-                lst = name_map.setdefault(old.lower(), [])
-                if new not in lst:
-                    lst.append(new)
-        for e, (old, new, model, mass) in plan.items():
-            m.setp(e, 'targetname', new)
-        present = {m.name(e).lower() for e in m.entities() if m.name(e)}       # names still in use after renaming
-        n_ret = n_dup = n_ref = n_tpl = 0
-        ambiguous, wild = [], []
-        # outputs aimed at a renamed prop
-        for src in m.entities():
-            arr = m.g(src, b'connectionsData') or []
-            for ci in list(arr):
-                c = m.E[ci]
-                tn = dmx_get(c, b'targetName').decode('utf-8', 'replace')
-                tl = tn.lower()
-                if tl in name_map:
-                    news = name_map[tl]
-                    keep_old = tl in present
-                    first = 0 if keep_old else 1
-                    if not keep_old:
-                        dmx_set(c, b'targetName', news[0].encode())
-                        n_ret += 1
-                    for nn in news[first:]:
-                        dup = m.new_el(c['type'], [[a[0], a[1], (list(a[2]) if isinstance(a[2], list) else a[2])] for a in c['attrs']])
-                        dmx_set(m.E[dup], b'targetName', nn.encode())
-                        dmx_geta(m.E[src], b'connectionsData')[2].append(dup)
-                        n_dup += 1
-                elif '*' in tn:
-                    import fnmatch
-                    hit = [o for o in name_map if fnmatch.fnmatchcase(o, tl)]
-                    if hit and not all(fnmatch.fnmatchcase(nn.lower(), tl) for o in hit for nn in name_map[o]):
-                        wild.append('%s -> "%s"' % (m.name(src) or m.cls(src), tn))
-        # point_template slots and other keyvalues that name a renamed prop
-        for ent in m.entities():
-            if m.cls(ent) == 'point_template':
-                slots = [(k, v) for k, v in self.keyvals(ent) if re.fullmatch(r'Template\d+', k)]
-                cur = [v for _k, v in slots if v]
-                if not any(v.lower() in name_map for v in cur):
-                    continue
-                out = []
-                for v in cur:
-                    if v.lower() in name_map:
-                        if v.lower() in present:
-                            out.append(v)
-                        for nn in name_map[v.lower()]:
-                            if nn not in out:
-                                out.append(nn)
-                    elif v not in out:
-                        out.append(v)
-                if len(out) > len(slots):
-                    self.rep.append('WARNING point_template "%s" needs %d Template slots but has %d: the extra names are not spawned' % (m.name(ent), len(out), len(slots)))
-                    out = out[:len(slots)]
-                for i, (k, _v) in enumerate(slots):
-                    m.setp(ent, k, out[i] if i < len(out) else '')
-                n_tpl += 1
-                continue
-            for k, v in self.keyvals(ent):
-                if not v or k.lower() in NO_REF_KEYS:
-                    continue
-                vl = v.lower()
-                if vl in name_map and vl not in present:
-                    news = name_map[vl]
-                    m.setp(ent, k, news[0])
-                    n_ref += 1
-                    if len(news) > 1:
-                        ambiguous.append('%s.%s = "%s" now "%s" (the name was shared by props of different mass)' % (m.name(ent) or m.cls(ent), k, v, news[0]))
-        # report
-        by_old = {}
-        for e, (old, new, model, mass) in plan.items():
-            by_old.setdefault((old, new), []).append((model, mass))
-        for (old, new), lst in sorted(by_old.items()):
-            self.rep.append('%s -> %s   x%d   %s   mass %g' % (old or '(unnamed)', new, len(lst), lst[0][0], lst[0][1]))
-        rb.log.append('physics props: %d renamed to <name>%s<mass> (%d already had the right name); %d outputs retargeted, %d copied for names split by mass; %d point_template lists and %d other keyvalues updated' % (
-            len(plan), MASS_TAG, same, n_ret, n_dup, n_tpl, n_ref))
-        if manual:
-            rb.log.append('%d props already have a push_<mass>_ name (kept as you set them; --props-override-manual to rename them too)' % len(manual))
-        if nomass:
-            rb.todo.append('%d prop models have no .phy under the Source 1 folders (pass --source1 DIR), so their props were not renamed: %s' % (
-                len(nomass), ', '.join('%s (%d)' % (k, len(v)) for k, v in list(nomass.items())[:6])))
-        if wild:
-            rb.todo.append('outputs aimed at a wildcard name that no longer matches every renamed prop (%d): %s' % (len(wild), '; '.join(wild[:5])))
-        if ambiguous:
-            rb.todo.append('%d keyvalues pointed at a name shared by props of different mass, they now point at the first: %s' % (len(ambiguous), '; '.join(ambiguous[:5])))
-        for line in self.rep:
-            if line.startswith('WARNING'):
-                rb.todo.append(line)
+                                    
+                               
+                                         
+                     
+                  
+                                                                            
+                       
+                           
+                                       
+                                                            
+                                           
+                        
+                                                           
+                                     
+                                                                                       
+                        
+                     
+                                                
+                                 
+                             
+                        
+                                     
+                                      
+                            
+                         
+                          
+                                          
+                                                                                                                         
+                         
+                                                                       
+                        
+                                                                                  
+                                       
+                                                   
+                          
+                         
+                        
+                                             
+                                                        
+                     
+                                                       
+                   
+                                                          
+                                  
+                                   
+                                                       
+                                        
+                                                                                                                  
+                                         
+                                
+                                         
+                                
+                                                    
+                                
+                           
+                                                                         
+                               
+                                  
+                                       
+                                            
+                                                
+                                    
+                                                                   
+                                  
+                                           
+                                                                                                                                       
+                                                                     
+                                                                             
+                                  
+                               
+                                  
+                                                                             
+                                                                                                               
+                                                                                   
+                                                                           
+                                
+                                              
+                                                                                                 
+                                                 
+                                                               
+                            
+                        
+                             
+                                             
+                                                
+                                         
+                                                      
+                                             
+                                              
+                                      
+                                     
+                                         
+                                                                                                                                                                                                                                     
+                                          
+                                                   
+                                                                  
+                          
+                        
+                                          
+                                                     
+                            
+                              
+                                                        
+                                       
+                                           
+                              
+                                     
+                                                                                                                                                                                                                    
+                
+                   
+                                                       
+                                                                   
+                                                      
+                                                                                                                        
+                                                                                                                                                                                                                         
+                                                                   
+                  
+                                                                                                                                                       
+                  
+                                                                                                                                                 
+                                                                                                      
+                
+                                                                                                                                                    
+                     
+                                                                                                                                                                                                                                     
+                             
+                                          
+                                    
 
-    def keyvals(self, ent):
-        """(key, string value) of every string property of an entity"""
-        out = []
-        for a in self.m.props(ent)['attrs']:
-            if a[1] == 5 and isinstance(a[2], (bytes, bytearray)):
-                out.append((a[0].decode('utf-8', 'replace'), a[2].decode('utf-8', 'replace')))
-        return out
+                           
+                                                                       
+                
+                                            
+                                                                  
+                                                                                              
+                  
 
 
 def dmx_get(el, k):
@@ -691,7 +679,7 @@ class Rebuild:
             self.log.append('%d underwater light_omni2 (%d lumens, range 512, no shadows) added in %d of %d water volumes' % (added, round(lum), used, len(waters)))
             self.todo.append('underwater lights are a heuristic (sparse grid, no light within 640 units); check the water areas and tune with --light-scale or delete them')
 
-    # -------------------------------------------------- 7. large faces (split)
+    # -------------------------------------------------- large faces (split)
     def split_faces(self):
         import splitfaces
         a = self.a
@@ -704,12 +692,11 @@ class Rebuild:
                 res['faces'], res['meshes'], res['pieces'], a.face_tile, ', %d new mesh(es)' % res['new_meshes'] if res['new_meshes'] else ''))
             self.todo.append('split faces: check the cut floors / ramps for seams or lightmap-density changes after the bake (new vertices are interpolated, UVs follow the world-aligned texture axes)')
         if res['skipped']:
-            self.todo.append('%d large face(s) could not be split (displacement meshes, rotated meshes or non-convex faces): see "large faces split" below' % len(res['skipped']))
+            self.todo.append('%d large face(s) could not be split (displacement meshes, rotated meshes or non-convex faces): see "large faces" below' % len(res['skipped']))
 
     # -------------------------------------------------- large faces (report only)
     def large_faces(self):
-        """Lists the very large lit faces that are left (all of them when splitting is off): one face is one lightmap chart,
-        so a huge floor can bake blotchy.  Changes nothing."""
+        """Lists very large lit faces: one face is one lightmap chart, so a huge floor can bake blotchy.  Changes nothing."""
         import numpy as np
         import lighting as skl
         m, limit = self.m, self.a.large_face_area
@@ -759,13 +746,10 @@ class Rebuild:
         for key, (tot, n, big, at) in sorted(groups.items(), key=lambda kv: -kv[1][2]):
             self.faces_report.append('%-22s %-34s %3d face(s), largest %9d sq units, at %s' % (key[0], key[1][:34], n, big, at))
         if groups:
-            if self.a.split_large_faces == 'off':
-                self.todo.append('%d groups of very large lit faces (over %d sq units, one lightmap chart each): see "large faces remaining" below; if a bake looks blotchy, run with --split-large-faces meshes or split them in Hammer' % (len(groups), limit))
-            else:
-                self.todo.append('%d groups of very large lit faces could not be split (over %d sq units, one lightmap chart each): see "large faces remaining" below; split them in Hammer only if their bake looks blotchy' % (len(groups), limit))
+            self.todo.append('%d groups of very large lit faces (over %d sq units, one lightmap chart each): see "large faces" below; split a face only if its bake looks blotchy' % (len(groups), limit))
         self.faces_ignored = ['%-22s %-34s %3d face(s), largest %9d sq units: %s' % (k[0], k[1][:34], v[1], v[2], k[2]) for k, v in sorted(ignored.items(), key=lambda kv: -kv[1][2])]
 
-    # -------------------------------------------------- 6. fix lights the lighting pass added
+    # -------------------------------------------------- 5. fix lights the lighting pass added
     def normalise_added(self):
         m = self.m
         mine = set(self.new)
@@ -814,7 +798,7 @@ def main():
     ap.add_argument('--light-scale', type=float, default=1.0, help='multiply the brightness of every recreated light (default 1)')
     ap.add_argument('--sun-scale', type=float, default=1.0, help='multiply the light_environment brightness (default 1)')
     ap.add_argument('--no-underwater', action='store_true', help='do not add lights inside water volumes')
-    ap.add_argument('--large-face-area', type=float, default=262144.0, help='lit faces larger than this many square units are split (see --split-large-faces) and any left over are reported (default 262144 = 512 x 512)')
+    ap.add_argument('--large-face-area', type=float, default=262144.0, help='report lit faces larger than this many square units (default 262144 = 512 x 512); nothing is changed')
     ap.add_argument('--split-large-faces', choices=('off', 'faces', 'meshes'), default='meshes', help='cut lit faces over --large-face-area on a world grid (T-junctions repaired): "faces" keeps one mesh, "meshes" (default) also moves the pieces into one mesh per tile so each gets its own cubemap / probe; "off" only reports')
     ap.add_argument('--face-tile', type=float, default=512.0, help='grid size for --split-large-faces (default 512)')
     ap.add_argument('--exposure', type=float, nargs=2, metavar=('MIN', 'MAX'), help='set post_processing_volume min / max exposure')
@@ -823,9 +807,9 @@ def main():
     ap.add_argument('--skip-lights', action='store_true', help='do not switch lights to Stationary')
     ap.add_argument('--skip-vis', action='store_true')
     ap.add_argument('--all-lower', action='store_true', help='vis: Lower hints instead of Low (for a vis compile that stalls)')
-    ap.add_argument('--source1', action='append', default=[], metavar='DIR', help='Source 1 folder that holds models\\... (repeat for several): the .phy files give each prop_physics its mass. The vmf folder and its parent are tried too')
-    ap.add_argument('--skip-props', action='store_true', help='do not rename physics props for push_mass.js')
-    ap.add_argument('--props-override-manual', action='store_true', help='also rename props that already have a push_<mass>_ name')
+                                                                                                                                                                                                                                             
+                                                                                                             
+                                                                                                                                   
     a = ap.parse_args()
 
     if a.restore:
@@ -864,11 +848,11 @@ def main():
         rb.sun()
         if not a.no_underwater:
             rb.underwater()
-        if not a.skip_props:
-            roots = [os.path.abspath(r) for r in a.source1] + [os.path.dirname(os.path.abspath(vmf)), os.path.dirname(os.path.dirname(os.path.abspath(vmf)))]
-            pn = PropNames(rb, roots)
-            pn.run(keep_manual=not a.props_override_manual)
-            rb.prop_report = pn.rep
+                            
+                                                                                                                                                             
+                                     
+                                                           
+                                   
         if a.exposure:
             for e in m.by_class('post_processing_volume'):
                 m.setp(e, 'minexposure', fmt(a.exposure[0]))
@@ -901,8 +885,8 @@ def main():
     if bk:
         lines += ['backup: %s' % bk, 'undo:   py rebuild_lighting.py "%s" --restore "%s"' % (a.vmap, bk)]
     lines += ['', 'changes:'] + ['  - ' + x for x in rb.log] + ['', 'check in game:'] + ['  - ' + x for x in rb.todo]
-    if getattr(rb, 'prop_report', None):
-        lines += ['', 'physics prop names (old -> new, count, model, mass):'] + ['  - ' + x for x in rb.prop_report]
+                                        
+                                                                                                                    
     if getattr(rb, 'split_notes', None):
         lines += ['', 'large faces split (%s):' % a.split_large_faces] + ['  - ' + x for x in rb.split_notes]
     lines += ['', 'large faces remaining (reported only, nothing was changed; over %d sq units, each is one lightmap chart):' % a.large_face_area] + ['  - ' + x for x in rb.faces_report]
