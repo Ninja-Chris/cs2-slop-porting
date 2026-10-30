@@ -2,9 +2,11 @@ r"""Rebuild the lighting of a ported CS2 map (.vmap) from the Source 1 map (.vmf
 
 Valve's importer gets CS:GO lights wrong (brightness comes out as NaN, so Hammer resets it to 1000 lumens, and the
 colour is turned into a 6600 K white).  This script throws away every light, light probe volume and visibility hint in
-the vmap and builds them again from the .vmf, then runs the light probe, stationary light and vis passes on top.
-Those passes are skink52's (github.com/skink52/cs2portdocs, tools/: dmx.py, kv2.py, vmapedit.py, lighting.py, visfit.py plus a
-probe-volume pass, bundled unchanged below; AI-generated, shared by skink52 for the porting knowledge in them).
+the vmap and builds them again from the .vmf, then runs the light probe, stationary light and vis passes on top.  It also
+renames physics props so push_mass.js can read their mass, and splits very large lit faces.
+The probe / stationary light / vis passes are skink52's (github.com/skink52/cs2portdocs, tools/: dmx.py, kv2.py, vmapedit.py,
+lighting.py, visfit.py plus a probe-volume pass, bundled unchanged below; AI-generated, shared by skink52 for the porting knowledge
+in them).  The face splitter (splitfaces, also bundled below) is this script's own.
 
   1. delete       light_omni2, light_barn, light_rect, light_capsule, light_omni, light_ortho, light_spot, light,
                   env_combined_light_probe_volume and visibility_hint (hand-placed ones too)
@@ -21,8 +23,16 @@ probe-volume pass, bundled unchanged below; AI-generated, shared by skink52 for 
   3. sun          light_environment is kept (the importer's values are right) -- --sun-scale scales its brightness
   4. underwater   Source water is lit by the lightmap, CS2 water volumes need lights: a few dim lights are put inside each
                   func_water / func_water_analog with no light already inside it (--no-underwater to skip)
-  5. passes       light probe volumes, stationary lights and vis hints (skink52's code, bundled in this file).  The extra lights that pass adds to unlit rooms get the map's median brightness
+  5. props        every prop_physics / prop_physics_override is renamed <name>__pm<mass> for push_mass.js: the mass of the
+                  Source 1 model's .phy x massscale (the .phy is looked for under --source1, the vmf's folder and its parent).
+                  Outputs, point_template slots and keyvalues that named the prop follow the new name; a name shared by props
+                  of different mass becomes one name per mass.  Props you named push_<mass>_... are kept (--skip-props to skip)
+  6. passes       light probe volumes, stationary lights and vis hints (skink52's code, bundled in this file).  The extra lights that pass adds to unlit rooms get the map's median brightness
                   (its template light is otherwise a 1000 lumen default)
+  7. large faces  one face is one lightmap chart, so a huge floor can bake blotchy: lit faces over --large-face-area
+                  (default 512 x 512) are cut on a --face-tile grid with T-junctions repaired, and by default every tile becomes
+                  its own mesh so it gets its own cubemap / probe (--split-large-faces faces keeps one mesh, off only reports).
+                  Displacements, rotated or scaled meshes and non-convex faces are not cut; they are listed in the report
 
 Safe by default: writes <map>_rebuilt.vmap next to the original and leaves the original alone.
 Close the map in Hammer first, or Hammer will overwrite the changes when you save.
@@ -35,8 +45,10 @@ Usage:
   py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --in-place            backs up to maps\backups\, then overwrites
   py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --light-scale 0.8      all point / spot lights 20% dimmer
   py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --sun-scale 0.9        sun 10% dimmer
-  py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --skip-passes          only rebuild the lights
+  py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --skip-passes          only rebuild the lights (props and face splitting still run)
   py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --exposure 0.8 1.0     post_processing_volume min / max exposure
+  py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --source1 "C:\...\csgo"     folder holding models\ with the .phy files
+  py rebuild_lighting.py mymap.vmap --vmf mymap.vmf --split-large-faces off      only report large faces, do not cut them
   py rebuild_lighting.py mymap.vmap --restore "maps\backups\mymap.20261029-190000.vmap"    undo
 
 The light scale (1000 lumens per 265 intensity) and the spotlight lumens come from the importer's own output and from the
@@ -58,6 +70,7 @@ _MODULES['lighting'] = '"""Stationary (dynamic) light pass.\n\nCS:GO lights impo
 _MODULES['visfit'] = '"""Vis compile time: hint boxes fitted to the play space, and sky shells out of vis where nothing needs them.\n\nThe CS2 vis compile (VIS3) spends most of its time clustering, sampling line of sight and merging clusters down to the 4,096 cap.\nHow many clusters it starts with depends on the visibility_hint that governs each part of the map (where hints overlap, the\nhighest resolution wins). So hints should only be fine where players can actually stand.\n\n1. Playable air: empty space at VS-unit voxels (world meshes that block players, incl. clips, detail and sky shells) connected\n   to a spawn or teleport destination, plus sealed compartments that hold gameplay entities (buttons, doors, triggers, trains,\n   weapons). The open void around the map never counts.\n2. Walkable band: playable air up to BAND units above something to stand on (world or entity meshes).\n3. Hints, on a 256-unit grid so they line up with the Lowest regions, Low and Lower never overlapping:\n     Low    (hintType 3, 64-unit grid)                         cells holding walkable band\n     Lower  (hintType 8, 64-unit grid, fewer initial clusters)  other playable air next to geometry (high ceilings, shafts)\n     Lowest (hintType 9, 256-unit grid)                         one box over the whole map: void, sealed-off rooms, open sky\n   Open sky far above an outdoor area gets no box of its own, so it falls to Lowest. all_lower=True makes the Low cells Lower too\n   (for maps whose vis merge stalls, e.g. mg_egypt_course). Boxes are merged while at least 75% (then 60%, 50%) of a box is its\n   own cells, aiming for at most 100 boxes.\n4. Sky shells (all-moondome / all-toolsskybox meshes) get Exclude from Vis unless they border playable air that is open once\n   every sky shell is gone. That test uses only vis-relevant geometry: Valve\'s docs say toolsnodraw is ignored by vis and by\n   its inside/outside test, and clips, triggers and meshes already excluded from vis don\'t count either.\n5. Optional extra_visex_box (world box): every world mesh entirely inside it is excluded from vis too (an unreachable\n   ex-3D-skybox, for example).\nExisting visibility_hint entities are replaced.\n"""\nimport collections\nimport numpy as np\nfrom scipy import ndimage\nimport dmx\nfrom lighting import mesh_polys\n\nPLAY = (\'info_player_counterterrorist\', \'info_player_terrorist\', \'info_player_start\', \'info_teleport_destination\')\nACTIVE = (\'func_button\', \'func_rot_button\', \'func_door\', \'func_door_rotating\', \'func_movelinear\', \'trigger_multiple\', \'trigger_once\',\n          \'trigger_teleport\', \'game_player_equip\', \'point_teleport\', \'func_tracktrain\', \'func_rotating\', \'func_physbox\')\nPHYS_PASS = (\'materials/tools/toolstrigger\', \'materials/tools/toolshint\', \'materials/tools/toolsskip\', \'materials/tools/toolsfog\',\n             \'materials/tools/toolslight\', \'materials/tools/toolsblocklight\', \'materials/tools/toolsblock_los\', \'materials/tools/toolsbuyzone\',\n             \'materials/tools/toolsbombsite\', \'materials/tools/toolsareaportal\', \'materials/tools/toolsoccluder\', \'materials/tools/toolsvisblocker\')\nCELL = 256.0\nBAND = 160.0\nCODE = {\'Low\': \'3\', \'Lower\': \'8\', \'Lowest\': \'9\'}\n\ndef is_shell(mats):\n    return bool(mats) and all(\'moondome\' in x or x == \'materials/tools/toolsskybox.vmat\' for x in mats)\n\ndef vis_relevant(mat):\n    if \'moondome\' in mat: return True\n    if mat.startswith(\'materials/tools/\'):\n        return mat.startswith((\'materials/tools/toolsskybox\', \'materials/tools/toolssolidblocklight\', \'materials/tools/toolsvisblocker\'))\n    return True\n\ndef meshes(m):\n    par = {n: p for n, p in m.walk()}\n    def in_ent(n):\n        p = par.get(n)\n        while p is not None:\n            if m.type(p) == b\'CMapEntity\': return p\n            p = par.get(p)\n        return None\n    out = []\n    for n, _ in m.walk():\n        if m.type(n) != b\'CMapMesh\': continue\n        pl = mesh_polys(m, n); mats = {x for x, _ in pl}\n        a = dmx.geta(m.E[n], b\'visexclude\')\n        out.append(dict(n=n, ent=in_ent(n), polys=pl, mats=mats, shell=is_shell(mats), visex=bool(a and a[2])))\n    return out\n\ndef raster(polys, lo, shape, vs, grid):\n    for L in polys:\n        L = np.asarray(L, np.float64)\n        if (np.floor((L.max(0) - lo) / vs) < 0).any() or (np.floor((L.min(0) - lo) / vs) >= shape).any(): continue\n        for i in range(1, len(L) - 1):\n            a, b, c = L[0], L[i], L[i + 1]\n            k = int(max(np.linalg.norm(b - a), np.linalg.norm(c - a), np.linalg.norm(c - b)) / (vs * 0.4)) + 2\n            u, w = np.meshgrid(np.linspace(0, 1, k), np.linspace(0, 1, k)); s = (u + w) <= 1\n            q = a + np.outer(u[s], b - a) + np.outer(w[s], c - a)\n            idx = np.floor((q - lo) / vs).astype(int)\n            idx = idx[((idx >= 0) & (idx < shape)).all(1)]\n            grid[idx[:, 0], idx[:, 1], idx[:, 2]] = True\n\ndef _border(lab):\n    return set(np.unique(np.concatenate([lab[0].ravel(), lab[-1].ravel(), lab[:, 0].ravel(), lab[:, -1].ravel(),\n                                         lab[:, :, 0].ravel(), lab[:, :, -1].ravel()]))) - {0}\n\ndef boxes_from_cells(cells):\n    left = set(cells); out = []\n    while left:\n        i, j, k = min(left)\n        x1 = i\n        while (x1 + 1, j, k) in left: x1 += 1\n        y1 = j\n        while all((x, y1 + 1, k) in left for x in range(i, x1 + 1)): y1 += 1\n        z1 = k\n        while all((x, y, z1 + 1) in left for x in range(i, x1 + 1) for y in range(j, y1 + 1)): z1 += 1\n        for x in range(i, x1 + 1):\n            for y in range(j, y1 + 1):\n                for z in range(k, z1 + 1): left.discard((x, y, z))\n        out.append(((i, j, k), (x1 + 1, y1 + 1, z1 + 1)))\n    return out\n\ndef merge_boxes(boxes, own, other, fill=0.75):\n    """join boxes whose union is mostly own cells and holds none of the other hint type\'s cells (boxes stay disjoint)"""\n    boxes = [(tuple(a), tuple(b)) for a, b in boxes]\n    if len(boxes) < 2: return boxes\n    allc = np.array(list(own | other))\n    o = allc.min(0); sz = allc.max(0) - o + 1\n    def cum(cs):\n        g = np.zeros(sz + 1, np.int32)\n        for c in cs: g[tuple(np.array(c) - o + 1)] = 1\n        return g.cumsum(0).cumsum(1).cumsum(2)\n    O, T = cum(own), cum(other)\n    def cnt(S, a, b):\n        x0, y0, z0 = np.array(a) - o; x1, y1, z1 = np.array(b) - o\n        return int(S[x1, y1, z1] - S[x0, y1, z1] - S[x1, y0, z1] - S[x1, y1, z0] + S[x0, y0, z1] + S[x0, y1, z0] + S[x1, y0, z0] - S[x0, y0, z0])\n    while len(boxes) > 1:\n        A = np.array([bx[0] for bx in boxes]); B = np.array([bx[1] for bx in boxes])\n        best = None\n        for i in range(len(boxes)):\n            ua = np.minimum(A[i], A[i + 1:]); ub = np.maximum(B[i], B[i + 1:])\n            for a, b in zip(ua, ub):\n                v = int(np.prod(b - a))\n                if v > 4096: continue\n                n = cnt(O, a, b)\n                if n / v < fill or (best and n / v <= best[0]) or cnt(T, a, b): continue\n                ins = np.all((A >= a) & (B <= b), 1); ovl = np.all((A < b) & (B > a), 1)\n                if (ovl & ~ins).any(): continue\n                best = (n / v, tuple(a), tuple(b), ins)\n        if not best: break\n        _, a, b, ins = best\n        boxes = [bx for k, bx in enumerate(boxes) if not ins[k]] + [(a, b)]\n    return boxes\n\ndef plan(m, all_lower=False, extra_visex_box=None, vs=None, margin=256.0):\n    ms = meshes(m)\n    world = [x for x in ms if x[\'ent\'] is None]\n    allp = np.array([p for x in world for _, l in x[\'polys\'] for p in l])\n    lo = allp.min(0) - margin; hi = allp.max(0) + margin\n    if vs is None:     # keep the grids within the cloud workspace\'s memory\n        vs = next(v for v in (16.0, 24.0, 32.0, 48.0) if np.prod(np.ceil((hi - lo) / v)) < 1.2e8)\n    shape = np.array([int(v) for v in np.ceil((hi - lo) / vs)])\n    phys = np.zeros(shape, bool); visg = np.zeros(shape, bool); ent = np.zeros(shape, bool); sh = np.zeros(shape, np.int32)\n    raster([l for x in world for mt, l in x[\'polys\'] if not mt.startswith(PHYS_PASS)], lo, shape, vs, phys)\n    raster([l for x in world if not x[\'visex\'] and not x[\'shell\'] for mt, l in x[\'polys\'] if vis_relevant(mt)], lo, shape, vs, visg)\n    raster([l for x in ms if x[\'ent\'] is not None for mt, l in x[\'polys\'] if not mt.startswith(PHYS_PASS)], lo, shape, vs, ent)\n    shells = [x for x in world if x[\'shell\']]\n    for si, x in enumerate(shells, 1):\n        g = np.zeros(shape, bool); raster([l for _, l in x[\'polys\']], lo, shape, vs, g); sh[g] = si\n    lab, _ = ndimage.label(~(phys | (sh > 0)))\n    def comp_at(p, r=3):\n        i = np.floor((np.array(p, float) - lo) / vs).astype(int)\n        for rr in range(r + 1):\n            v = lab[tuple(slice(max(0, i[k] - rr), i[k] + rr + 1) for k in range(3))]; v = v[v > 0]\n            if v.size: return int(np.bincount(v).argmax())\n        return 0\n    seeds = {comp_at(np.array(m.origin(e), float) + [0, 0, 36]) for e in m.by_class(*PLAY)} - {0}\n    act = {comp_at(m.origin(e), 2) for e in m.entities() if m.cls(e) in ACTIVE or m.cls(e).startswith(\'weapon_\')} - {0}\n    border = _border(lab)\n    comps = (seeds | act) - border\n    P = np.isin(lab, list(comps))\n    del lab\n    solid = phys | (sh > 0) | ent\n    band = np.zeros(shape, bool)\n    for k in range(1, int(BAND / vs) + 1):\n        band[:, :, k:] |= solid[:, :, :-k]\n    band &= P\n    del solid\n    def cells_of(mask):\n        idx = np.argwhere(mask)\n        return set(map(tuple, np.floor((lo + (idx + 0.5) * vs) / CELL).astype(int)))\n    pc, bc = cells_of(P), cells_of(band)\n    geo = cells_of((phys & (sh == 0)) | visg | ent)\n    low = set(bc); lower = (pc - low) & geo\n    if all_lower: lower |= low; low = set()\n    for fill in (0.75, 0.6, 0.5):\n        hints = [(\'Low\', a, b) for a, b in merge_boxes(boxes_from_cells(low), low, lower, fill)] + \\\n                [(\'Lower\', a, b) for a, b in merge_boxes(boxes_from_cells(lower), lower, low, fill)]\n        if len(hints) <= 100: break\n    hints = [(t, np.array(a) * CELL, np.array(b) * CELL) for t, a, b in hints]\n    hints.append((\'Lowest\', np.floor(allp.min(0) / 256) * 256 - 256, np.ceil(allp.max(0) / 256) * 256 + 256))\n    # sky shells: keep the ones bordering playable air that is open once all sky shells are gone\n    vl, _ = ndimage.label(~visg)\n    leaky = P & np.isin(vl, list(_border(vl)))\n    del vl\n    near_leak = ndimage.binary_dilation(leaky, iterations=2)\n    keep_ids = set(np.unique(sh[near_leak & (sh > 0)])) - {0}\n    exclude = [x for si, x in enumerate(shells, 1) if si not in keep_ids and not x[\'visex\']]\n    extra = []\n    if extra_visex_box is not None:\n        a, b = np.array(extra_visex_box[0], float), np.array(extra_visex_box[1], float)\n        for x in world:\n            if x[\'visex\'] or x[\'shell\']: continue\n            bb = m.bounds(x[\'n\'])\n            if bb and (np.array(bb[0]) >= a).all() and (np.array(bb[1]) <= b).all(): extra.append(x)\n    stats = dict(vs=vs, play=P.sum() * vs ** 3 / 1e9, band=band.sum() * vs ** 3 / 1e9, shells=len(shells), kept=len(shells) - len(exclude),\n                 hints=dict(collections.Counter(h[0] for h in hints)))\n    return dict(hints=hints, exclude=exclude, extra=extra, stats=stats)\n\ndef apply(m, pl):\n    for e in m.by_class(\'visibility_hint\'): m.remove_node(e)\n    for t, mn, mx in pl[\'hints\']:\n        o = (mn + mx) / 2\n        m.new_entity(\'visibility_hint\', o, {\'box_mins\': \' \'.join(\'%g\' % v for v in mn - o), \'box_maxs\': \' \'.join(\'%g\' % v for v in mx - o),\n                                            \'hintType\': CODE[t]})\n    for x in pl[\'exclude\'] + pl[\'extra\']:\n        a = dmx.geta(m.E[x[\'n\']], b\'visexclude\')\n        if a: a[2] = True\n        else: dmx.set_(m.E[x[\'n\']], b\'visexclude\', dmx.T_BOOL, True)\n\ndef run(m, c, all_lower=False, extra_visex_box=None):\n    old = collections.Counter({\'3\': \'Low\', \'8\': \'Lower\', \'9\': \'Lowest\', \'2\': \'Medium\', \'0\': \'High\', \'1\': \'Normal\', \'10\': \'Reduced\'}\n                              .get(m.P(e, \'hintType\', \'\'), \'?\') for e in m.by_class(\'visibility_hint\'))\n    pl = plan(m, all_lower, extra_visex_box)\n    apply(m, pl)\n    s = pl[\'stats\']; h = s[\'hints\']\n    c.log.append(\'visfit (%g-unit voxels): %.1f billion cubic units of playable air, %.1f of it walkable band; hints %d Low, %d Lower, %d Lowest%s\'\n                 % (s[\'vs\'], s[\'play\'], s[\'band\'], h.get(\'Low\', 0), h.get(\'Lower\', 0), h.get(\'Lowest\', 0),\n                    (\' (replacing \' + \', \'.join(\'%d %s\' % (v, k) for k, v in old.items()) + \')\') if old else \'\'))\n    if s[\'shells\']:\n        c.log.append(\'visfit: %d of %d sky shell meshes set to Exclude from Vis, %d kept because they close playable air\'\n                     % (len(pl[\'exclude\']), s[\'shells\'], s[\'kept\']))\n    if pl[\'extra\']: c.log.append(\'visfit: %d meshes inside %s set to Exclude from Vis\' % (len(pl[\'extra\']), extra_visex_box))\n    c.todo.append(\'vis: if anything pops in or out of view where players stand, change the nearest Lower hint to Low (or Low to Medium)\')\n    return pl\n'
 
 _MODULES['probes'] = '"""Light probe pass: env_combined_light_probe_volume fitted to each playable compartment.\n\nPlayers, weapons and props get their indirect light from light probe volumes; without them they render dark.\nUnlike daylight.py (one slab per 2048 units along the map\'s longest axis), this fits volumes to the actual\nempty space of each compartment a player can reach, split into tiles of at most TILE units so no single\nvolume covers a huge empty bounding box.\n\nPlayable compartments: empty-space regions (world geometry voxelised and flood-filled, as in lighting.py)\nholding a spawn or teleport destination. The open void outside the map never counts.\nExisting probe volumes are left alone unless replace=True.\n"""\nimport numpy as np\nfrom lighting import world_polys, voxelise, label_empty\n\nSEEDS = (\'info_player_counterterrorist\', \'info_player_terrorist\', \'info_player_start\', \'info_teleport_destination\')\nPROBE_CLASSES = (\'env_combined_light_probe_volume\', \'env_light_probe_volume\')\nTILE = 2048.0      # max volume edge length\nPAD = 48.0         # extra space around the compartment so probes cover the walls\nMIN_VOX = 8        # ignore tiny pockets\n\nPROPS = dict(StartDisabled=0, cubemaptexture=\'\', bakenearz=\'2.0\', bakefarz=\'4096.0\', lightgroup=\'\', moveable=0,\n             lightprobetexture=\'\', voxel_size=\'48.0\', flood_fill=1, voxelize=1, light_probe_volume_from_cubemap=0,\n             storage=-1, indoor_outdoor_level=0, edge_fade_dists=\'0 32 0\', clientSideEntity=1)\n\n\ndef run(m, c, vs=32.0, replace=False):\n    existing = m.by_class(*PROBE_CLASSES)\n    if existing and not replace:\n        c.log.append(\'probes: map already has %d light probe volumes - left alone (run the probes_replace pass to refit them)\' % len(existing))\n        return\n    polys = world_polys(m)\n    if not polys:\n        c.todo.append(\'probes: no world geometry found - no probe volumes added\')\n        return\n    solid, lo = voxelise(polys, vs)\n    lab, _ = label_empty(solid)\n    shape = np.array(lab.shape)\n    border = set(np.unique(np.concatenate([lab[0].ravel(), lab[-1].ravel(), lab[:, 0].ravel(), lab[:, -1].ravel(),\n                                           lab[:, :, 0].ravel(), lab[:, :, -1].ravel()]))) - {0}\n\n    def region_at(p, r=2):\n        i = np.clip(np.floor((np.asarray(p, float) - lo) / vs).astype(int), 0, shape - 1)\n        for rr in range(r + 1):\n            v = lab[tuple(slice(max(0, i[k] - rr), i[k] + rr + 1) for k in range(3))]\n            v = v[v > 0]\n            if v.size: return int(np.bincount(v).argmax())\n        return 0\n\n    regions, leaked = set(), 0\n    for e in m.by_class(*SEEDS):\n        r = region_at(np.array(m.origin(e), float) + [0, 0, 36])\n        if r in border: leaked += 1\n        elif r: regions.add(r)\n    if leaked:\n        c.todo.append(\'probes: %d spawns / teleport destinations sit in space connected to the outside of the map (a leak?) - no probes there\' % leaked)\n    if not regions:\n        c.todo.append(\'probes: no sealed playable compartments found - no probe volumes added\')\n        return\n\n    for e in existing: m.remove_node(e)\n    n_vol = 0\n    for r in sorted(regions):\n        idx = np.argwhere(lab == r)\n        if len(idx) < MIN_VOX: continue\n        P = lo + (idx + 0.5) * vs\n        tile = np.floor((P - P.min(0)) / TILE).astype(int)\n        for t in np.unique(tile, axis=0):\n            sel = P[(tile == t).all(1)]\n            mn = sel.min(0) - vs / 2 - PAD\n            mx = sel.max(0) + vs / 2 + PAD\n            o = (mn + mx) / 2\n            props = dict(PROPS, box_mins=\'%f %f %f\' % tuple(mn - o), box_maxs=\'%f %f %f\' % tuple(mx - o))\n            m.new_entity(\'env_combined_light_probe_volume\', o, props)\n            n_vol += 1\n    c.log.append(\'probes: %s%d env_combined_light_probe_volume fitted to %d playable compartments (tiles up to %g units)\'\n                 % (\'replaced %d existing volumes with \' % len(existing) if existing else \'\', n_vol, len(regions), TILE))\n    c.todo.append(\'probes: after a full bake, check players / weapons are lit evenly; if a room looks off, check its probe volume covers it\')\n'
+_MODULES['splitfaces'] = '"""Split very large lit faces of a .vmap into tiles (development copy; pasted into rebuild_lighting.py).\n\nWhy: in CS2 a face is one lightmap chart, and a mesh (CMapMesh) gets one probe / cubemap for the whole mesh. A huge floor\ntherefore bakes blotchy and reflects the wrong place.  This cuts faces over `limit` square units on a world-aligned grid\n(`cell` units) and, optionally, gives every grid cell its own copy of the mesh.\n\nAll geometry is rebuilt from polygons: vertices are welded by position, every undirected edge gets two half-edges (the twin of\na boundary edge has face -1), and the corner data (texcoord / normal / tangent / vertex paint) is interpolated along cut edges.\nMeshes with subdivision data (importer displacements) and non-convex faces are left alone.\n"""\nimport numpy as np\n\nEPS = 0.01          # a point this close to a cut plane counts as on it\nWELD = 3            # vertex welding, decimals\n\n\n# ----------------------------------------------------------------------------------------------------------- reading\ndef _streams(m, node, part):\n    """-> {stream name: (element index, data list)} for meshData.<part>"""\n    md = m.g(node, b\'meshData\')\n    pd = m.g(md, part)\n    return {m.E[st][\'name\'].decode(): (st, m.g(st, b\'data\')) for st in (m.g(pd, b\'streams\') or [])}\n\n\ndef mesh_has_subdivision(m, node):\n    sd = m.g(m.g(node, b\'meshData\'), b\'subdivisionData\')\n    return bool(sd is not None and m.g(sd, b\'streams\'))\n\n\ndef mesh_read(m, node):\n    """-> (polys, materials).  poly = {\'attrs\': {faceData stream: value}, \'corners\': [{\'pos\': ndarray(3), \'fvd\': {stream: ndarray}}]}"""\n    md = m.g(node, b\'meshData\')\n    dest, nxt = m.g(md, b\'edgeVertexIndices\'), m.g(md, b\'edgeNextIndices\')\n    fe, fd = m.g(md, b\'faceEdgeIndices\'), m.g(md, b\'faceDataIndices\')\n    evd, vdi = m.g(md, b\'edgeVertexDataIndices\'), m.g(md, b\'vertexDataIndices\')\n    pos = _streams(m, node, b\'vertexData\')[\'position:0\'][1]\n    fvd = {k: v[1] for k, v in _streams(m, node, b\'faceVertexData\').items()}\n    fdat = {k: v[1] for k, v in _streams(m, node, b\'faceData\').items()}\n    polys = []\n    for f, h0 in enumerate(fe):\n        corners, h = [], h0\n        for _ in range(len(dest) + 1):\n            corners.append({\'pos\': np.array(pos[vdi[dest[h]]], float),\n                            \'fvd\': {k: np.array(v[evd[h]], float) for k, v in fvd.items()}})\n            h = nxt[h]\n            if h == h0:\n                break\n        polys.append({\'attrs\': {k: v[fd[f]] for k, v in fdat.items()}, \'corners\': corners})\n    return polys, [x.decode(\'utf-8\', \'replace\') if isinstance(x, (bytes, bytearray)) else x for x in m.g(md, b\'materials\')]\n\n\n# ------------------------------------------------------------------------------------------------------------ geometry\ndef poly_area(corners):\n    P = np.array([c[\'pos\'] for c in corners])\n    n = np.zeros(3)\n    for i in range(1, len(P) - 1):\n        n += np.cross(P[i] - P[0], P[i + 1] - P[0])\n    return float(np.linalg.norm(n) / 2)\n\n\ndef is_convex(corners, tol=1e-6):\n    P = np.array([c[\'pos\'] for c in corners])\n    n = np.zeros(3)\n    for i in range(1, len(P) - 1):\n        n += np.cross(P[i] - P[0], P[i + 1] - P[0])\n    ln = np.linalg.norm(n)\n    if ln < 1e-9:\n        return False\n    n /= ln\n    for i in range(len(P)):\n        c = np.dot(np.cross(P[(i + 1) % len(P)] - P[i], P[(i + 2) % len(P)] - P[(i + 1) % len(P)]), n)\n        if c < -tol * max(1.0, ln):\n            return False\n    return True\n\n\ndef _lerp(a, b, t):\n    out = {\'pos\': a[\'pos\'] + (b[\'pos\'] - a[\'pos\']) * t, \'fvd\': {}}\n    for k in a[\'fvd\']:\n        v = a[\'fvd\'][k] + (b[\'fvd\'][k] - a[\'fvd\'][k]) * t\n        if k.startswith(\'normal\'):\n            ln = np.linalg.norm(v)\n            if ln > 1e-9:\n                v = v / ln\n        out[\'fvd\'][k] = v\n    return out\n\n\ndef _edge_key(p, q):\n    a, b = tuple(np.round(p, WELD)), tuple(np.round(q, WELD))\n    return (a, b) if a <= b else (b, a)\n\n\ndef clip_poly(corners, axis, c):\n    """Cut a convex polygon with the plane  pos[axis] = c  -> (below, above) corner lists (either may be empty)."""\n    lo, hi = [], []\n    n = len(corners)\n    for i in range(n):\n        a, b = corners[i], corners[(i + 1) % n]\n        sa, sb = a[\'pos\'][axis] - c, b[\'pos\'][axis] - c\n        sa0, sb0 = abs(sa) < EPS, abs(sb) < EPS\n        if sa0:\n            lo.append(a)\n            hi.append(a)\n        elif sa < 0:\n            lo.append(a)\n        else:\n            hi.append(a)\n        if not sa0 and not sb0 and (sa < 0) != (sb < 0):\n            if tuple(np.round(a[\'pos\'], WELD)) <= tuple(np.round(b[\'pos\'], WELD)):\n                p = _lerp(a, b, sa / (sa - sb))\n            else:                                   # always interpolate from the same end, so both faces sharing the edge agree\n                p = _lerp(b, a, sb / (sb - sa))\n            p[\'pos\'][axis] = c                      # exactly on the plane, so both sides weld\n            lo.append(p)\n            hi.append(p)\n    return lo, hi\n\n\ndef _usable(corners):\n    return len(corners) >= 3 and poly_area(corners) > 1e-4\n\n\n# ----------------------------------------------------------------------------------------------------------- cutting\ndef cut_polys(polys, limit, cell, candidate, min_piece=None):\n    """Cut every candidate poly with area >= limit on the grid.  -> (new polys, cut count, skipped [(reason, area)])"""\n    min_piece = cell / 64.0 if min_piece is None else min_piece\n    plan, skipped = {}, []\n    for i, p in enumerate(polys):\n        if not candidate(p):\n            continue\n        area = poly_area(p[\'corners\'])\n        if area <= limit * 1.0001:                  # a tile of exactly cell x cell is fine\n            continue\n        if not is_convex(p[\'corners\']):\n            skipped.append((\'not convex\', area))\n            continue\n        P = np.array([c[\'pos\'] for c in p[\'corners\']])\n        planes = []\n        for axis in range(3):\n            lo, hi = P[:, axis].min(), P[:, axis].max()\n            if hi - lo <= cell:\n                continue\n            k = int(np.ceil((lo + EPS) / cell))\n            while k * cell < hi - EPS:\n                c = k * cell\n                if c - lo >= min_piece and hi - c >= min_piece:\n                    planes.append((axis, float(c)))\n                k += 1\n        if planes:\n            plan[i] = planes\n    # points where the planes cross the edges of cut faces: the neighbours across those edges need the same points\n    edge_pts = {}\n    for i, planes in plan.items():\n        cs = polys[i][\'corners\']\n        for j in range(len(cs)):\n            a, b = cs[j], cs[(j + 1) % len(cs)]\n            for axis, c in planes:\n                sa, sb = a[\'pos\'][axis] - c, b[\'pos\'][axis] - c\n                if abs(sa) >= EPS and abs(sb) >= EPS and (sa < 0) != (sb < 0):\n                    if tuple(np.round(a[\'pos\'], WELD)) <= tuple(np.round(b[\'pos\'], WELD)):\n                        p = a[\'pos\'] + (b[\'pos\'] - a[\'pos\']) * (sa / (sa - sb))\n                    else:\n                        p = b[\'pos\'] + (a[\'pos\'] - b[\'pos\']) * (sb / (sb - sa))\n                    p[axis] = c\n                    edge_pts.setdefault(_edge_key(a[\'pos\'], b[\'pos\']), {})[tuple(np.round(p, WELD))] = p\n    out, cut = [], 0\n    for i, p in enumerate(polys):\n        cs = p[\'corners\']\n        if edge_pts:\n            ncs = []\n            for j in range(len(cs)):\n                a, b = cs[j], cs[(j + 1) % len(cs)]\n                pts = edge_pts.get(_edge_key(a[\'pos\'], b[\'pos\']))\n                if pts:\n                    L = np.linalg.norm(b[\'pos\'] - a[\'pos\'])\n                    ts = sorted(((float(np.dot(q - a[\'pos\'], b[\'pos\'] - a[\'pos\']) / (L * L)), q) for q in pts.values()), key=lambda x: x[0])\n                    mids = [_lerp(a, b, t) for t, _ in ts]\n                    for mid, (_, q) in zip(mids, ts):\n                        mid[\'pos\'] = q.copy()\n                    ncs.extend(mids)\n                ncs.append(b)                       # corner j+1 (so the list starts at corner 1; rotated back below)\n            cs = ncs[-1:] + ncs[:-1]                # restore the original starting corner\n        if i in plan:\n            pieces = [cs]\n            for axis, c in plan[i]:\n                nxt = []\n                for pc in pieces:\n                    lo, hi = clip_poly(pc, axis, c)\n                    nxt += [x for x in (lo, hi) if _usable(x)]\n                pieces = nxt\n            for pc in pieces:\n                out.append({\'attrs\': p[\'attrs\'], \'corners\': pc, \'cut\': True})\n            cut += 1\n        else:\n            out.append({\'attrs\': p[\'attrs\'], \'corners\': cs})\n    return out, cut, skipped\n\n\n# ----------------------------------------------------------------------------------------------------------- writing\ndef mesh_write(m, node, polys):\n    """Rebuild the half-edge arrays and data streams of `node` from polygons.  Returns an error string or None (mesh untouched on error)."""\n    import dmx\n    md = m.g(node, b\'meshData\')\n    verts, vidx = [], {}\n\n    def vid(p):\n        k = tuple(np.round(p, WELD))\n        if k not in vidx:\n            vidx[k] = len(verts)\n            verts.append(p)\n        return vidx[k]\n\n    faces = []\n    for p in polys:\n        pairs = []\n        for c in p[\'corners\']:\n            k = vid(c[\'pos\'])\n            if pairs and pairs[-1][0] == k:\n                continue                            # two corners welded together: drop the repeat\n            pairs.append((k, c))\n        if len(pairs) > 1 and pairs[0][0] == pairs[-1][0]:\n            pairs.pop()\n        ids = [k for k, _ in pairs]\n        if len(ids) < 3 or len(set(ids)) != len(ids):\n            return \'degenerate or pinched face after welding\'\n        faces.append(({\'attrs\': p[\'attrs\'], \'corners\': [c for _, c in pairs]}, ids))\n    half = {}                                       # directed (origin, destination) -> half-edge index\n    dest, face_of, corner_of, edge_of, opp, nxt, fedge = [], [], [], [], [], [], []\n    for f, (p, ids) in enumerate(faces):\n        n = len(ids)\n        hs = []\n        for j in range(n):\n            u, v = ids[j - 1], ids[j]               # the half-edge into corner j runs from the previous corner to this one\n            h = half.get((u, v))\n            if h is None:                           # new edge: face side 2k, boundary twin 2k+1\n                k = len(dest) // 2\n                h = 2 * k\n                dest += [v, u]\n                face_of += [-1, -1]\n                corner_of += [None, None]\n                edge_of += [k, k]\n                opp += [h + 1, h]\n                nxt += [-1, -1]\n                half[(u, v)] = h\n                half[(v, u)] = h + 1\n            elif face_of[h] != -1:\n                return \'non-manifold edge (two faces use the same direction)\'\n            face_of[h] = f\n            corner_of[h] = (f, j)\n            hs.append(h)\n        for j in range(n):\n            nxt[hs[j]] = hs[(j + 1) % n]\n        fedge.append(hs[0])\n    H = len(dest)\n    # boundary loops: next boundary half-edge starts where this one ends\n    out_b = {}\n    for h in range(H):\n        if face_of[h] == -1:\n            origin = dest[opp[h]]\n            out_b.setdefault(origin, []).append(h)\n    for h in range(H):\n        if face_of[h] == -1:\n            lst = out_b.get(dest[h], [])\n            nxt[h] = lst.pop(0) if lst else opp[h]\n    nv = len(verts)\n    vedge = [-1] * nv\n    for h in range(H):\n        o = dest[opp[h]]\n        if vedge[o] == -1 or (face_of[h] != -1 and face_of[vedge[o]] == -1):\n            vedge[o] = h\n    if -1 in vedge:\n        return \'unused vertex\'\n    nf = len(faces)\n    # ---- write\n    def setv(el, name, val):\n        a = dmx.geta(m.E[el], name)\n        a[2] = val\n\n    setv(md, b\'vertexEdgeIndices\', vedge)\n    setv(md, b\'vertexDataIndices\', list(range(nv)))\n    setv(md, b\'edgeVertexIndices\', dest)\n    setv(md, b\'edgeOppositeIndices\', opp)\n    setv(md, b\'edgeNextIndices\', nxt)\n    setv(md, b\'edgeFaceIndices\', face_of)\n    setv(md, b\'edgeDataIndices\', edge_of)\n    setv(md, b\'edgeVertexDataIndices\', list(range(H)))\n    setv(md, b\'faceEdgeIndices\', fedge)\n    setv(md, b\'faceDataIndices\', list(range(nf)))\n    ne = H // 2\n\n    def resize(part, size, fill):\n        pd = m.g(md, part)\n        setv(pd, b\'size\', size)\n        for st in m.g(pd, b\'streams\') or []:\n            name = m.E[st][\'name\'].decode()\n            setv(st, b\'data\', fill(name))\n\n    resize(b\'vertexData\', nv, lambda name: [list(map(float, v)) for v in verts])\n    zero = {}\n    for k, (st, data) in _streams(m, node, b\'faceVertexData\').items():\n        zero[k] = [0.0] * len(data[0]) if data else [0.0]\n\n    def fvd_fill(name):\n        arr = [list(zero[name]) for _ in range(H)]\n        for h in range(H):\n            if corner_of[h] is not None:\n                f, j = corner_of[h]\n                arr[h] = [float(x) for x in faces[f][0][\'corners\'][j][\'fvd\'][name]]\n        return arr\n\n    # (zero template is taken from the old data before it is overwritten)\n    resize(b\'faceVertexData\', H, fvd_fill)\n    resize(b\'edgeData\', ne, lambda name: [0] * ne)\n    resize(b\'faceData\', nf, lambda name: [faces[f][0][\'attrs\'][name] for f in range(nf)])\n    sd = m.g(md, b\'subdivisionData\')\n    if sd is not None:\n        setv(sd, b\'subdivisionLevels\', [0] * H)\n    return None\n\n\n# ----------------------------------------------------------------------------------------------------------- checking\ndef mesh_check(m, node):\n    """Structural check of the half-edge arrays.  -> list of problems (empty = fine)"""\n    md = m.g(node, b\'meshData\')\n    g = lambda k: m.g(md, k)\n    dest, opp, nxt, face = g(b\'edgeVertexIndices\'), g(b\'edgeOppositeIndices\'), g(b\'edgeNextIndices\'), g(b\'edgeFaceIndices\')\n    fe, vedge = g(b\'faceEdgeIndices\'), g(b\'vertexEdgeIndices\')\n    evd, edi = g(b\'edgeVertexDataIndices\'), g(b\'edgeDataIndices\')\n    bad = []\n    H = len(dest)\n    if not (len(opp) == len(nxt) == len(face) == len(evd) == len(edi) == H):\n        return [\'array lengths differ\']\n    if sorted(evd) != list(range(len(evd))):\n        bad.append(\'edgeVertexDataIndices is not a permutation\')\n    for h in range(H):\n        if opp[opp[h]] != h:\n            bad.append(\'opposite of opposite of %d\' % h)\n        if dest[opp[h]] == dest[h]:\n            bad.append(\'half-edge %d is a loop\' % h)\n        if dest[h] != dest[opp[nxt[h]]] and False:\n            pass\n        if dest[opp[nxt[h]]] != dest[h]:\n            bad.append(\'next of %d does not start where it ends\' % h)\n        if face[h] != -1 and face[nxt[h]] != face[h]:\n            bad.append(\'next of %d leaves the face\' % h)\n    for f, h0 in enumerate(fe):\n        h, seen = h0, 0\n        while True:\n            if face[h] != f:\n                bad.append(\'face %d loop has a foreign half-edge\' % f)\n                break\n            h = nxt[h]\n            seen += 1\n            if h == h0 or seen > H:\n                break\n        if seen > H:\n            bad.append(\'face %d loop does not close\' % f)\n    for v, h in enumerate(vedge):\n        if dest[opp[h]] != v:\n            bad.append(\'vertexEdge of %d does not start at it\' % v)\n    dm = m.g(m.g(node, b\'meshData\'), b\'vertexData\')\n    for st in m.g(dm, b\'streams\'):\n        if len(m.g(st, b\'data\')) != m.g(dm, b\'size\'):\n            bad.append(\'vertexData stream length\')\n    return bad[:10]\n\n\n# ----------------------------------------------------------------------------------------------------------- whole-map pass\ndef _identity_xform(m, node):\n    o = m.g(node, b\'origin\', [0, 0, 0]); a = m.g(node, b\'angles\', [0, 0, 0]); sc = m.g(node, b\'scales\', [1, 1, 1])\n    ok = all(abs(x) < 1e-4 for x in a) and all(abs(x - 1) < 1e-4 for x in sc)\n    return ok, np.array(o, dtype=float)\n\n\ndef split_large(m, limit, cell, mode, skip_mat, log):\n    """Cut every lit face over `limit` sq units on a world grid of `cell`.  mode \'faces\' keeps one mesh; \'meshes\' also moves the\n    pieces into one mesh per grid cell (a cubemap / probe is assigned per mesh).  -> dict of counts + list of skipped notes"""\n    res = dict(meshes=0, faces=0, pieces=0, new_meshes=0, skipped=[])\n    owner = {}\n\n    def walk(n, label, cls):\n        for c in m.children(n):\n            t = m.type(c)\n            if t == b\'CMapMesh\':\n                owner[c] = (n, label, cls)\n            elif t == b\'CMapEntity\':\n                walk(c, \'%s %s\' % (m.cls(c), m.name(c) or \'-\'), m.cls(c))\n            else:\n                walk(c, label, cls)\n    walk(m.world, \'world\', \'world\')\n    for node, (parent, label, cls) in list(owner.items()):\n        if m.g(node, b\'meshData\') is None:\n            continue\n        if cls.startswith(\'func_water\') or cls.startswith(\'trigger_\'):\n            continue\n        ent_nodes = [e for e in m.entities() if m.cls(e) == cls and \'%s %s\' % (cls, m.name(e) or \'-\') == label] if cls != \'world\' else []\n        if ent_nodes and m.P(ent_nodes[0], \'lightmapstatic\', \'1\') == \'0\':\n            continue\n        try:\n            polys, mats = mesh_read(m, node)\n        except Exception:\n            continue\n        cand = lambda p: not any(x in mats[p[\'attrs\'][\'materialindex:0\']] for x in skip_mat)\n        big = [p for p in polys if cand(p) and poly_area(p[\'corners\']) > limit * 1.0001]\n        if not big:\n            continue\n        if mesh_has_subdivision(m, node):\n            res[\'skipped\'].append(\'%s (mesh %d): %d large face(s) in a displacement / subdivision mesh, not touched\' % (label, node, len(big)))\n            continue\n        ok, org = _identity_xform(m, node)\n        if not ok:\n            res[\'skipped\'].append(\'%s (mesh %d): %d large face(s), mesh is rotated or scaled, not touched\' % (label, node, len(big)))\n            continue\n        for p in polys:\n            p[\'corners\'] = [{\'pos\': c[\'pos\'] + org, \'fvd\': c[\'fvd\']} for c in p[\'corners\']]\n        newp, cut, sk = cut_polys(polys, limit, cell, cand)\n        for kind, area in sk:\n            res[\'skipped\'].append(\'%s (mesh %d): face of %d sq units %s, not cut\' % (label, node, area, kind))\n        if not cut:\n            continue\n        for p in newp:                              # corner dicts can be shared between pieces, so copy rather than shift in place\n            p[\'corners\'] = [{\'pos\': c[\'pos\'] - org, \'fvd\': c[\'fvd\']} for c in p[\'corners\']]\n        groups = {}\n        rest = []\n        if mode == \'meshes\':\n            for p in newp:\n                if p.get(\'cut\'):\n                    ctr = np.mean([c[\'pos\'] for c in p[\'corners\']], axis=0) + org\n                    groups.setdefault(tuple(int(x) for x in np.floor(ctr / cell)), []).append(p)\n                else:\n                    rest.append(p)\n        else:\n            rest = newp\n        if len(groups) <= 1 and not rest:\n            groups = {}\n            rest = newp\n        if len(groups) > 0 and rest:\n            pass\n        # write the original mesh first; if it has nothing left, it takes the first group\n        keys = sorted(groups)\n        first = rest if rest else groups[keys.pop(0)] if groups else newp\n        err = mesh_write(m, node, first)\n        if err:\n            res[\'skipped\'].append(\'%s (mesh %d): %s, not touched\' % (label, node, err))\n            continue\n        made = []\n        failed = False\n        for k in keys:\n            nid = [m.next_node_id()]\n            new = m.import_subtree(m, node, {}, nid)\n            e = mesh_write(m, new, groups[k])\n            if e:\n                failed = True\n                res[\'skipped\'].append(\'%s (mesh %d): tile %s: %s\' % (label, node, k, e))\n                break\n            made.append(new)\n        if failed:                                  # put every piece back in the original mesh\n            mesh_write(m, node, newp)\n            continue\n        if made:\n            from dmx import geta\n            arr = geta(m.E[parent], b\'children\')\n            arr[2].extend(made)\n        res[\'meshes\'] += 1\n        res[\'faces\'] += cut\n        res[\'pieces\'] += sum(1 for p in newp if p.get(\'cut\'))\n        res[\'new_meshes\'] += len(made)\n        log.append(\'%s (mesh %d): cut %d large face(s) into %d pieces%s\' % (label, node, cut, sum(1 for p in newp if p.get(\'cut\')), \', %d new mesh(es)\' % len(made) if made else \'\'))\n    return res\n'
 
 
 def _install():
@@ -65,7 +78,7 @@ def _install():
     for name in _MODULES:
         if name in sys.modules: continue
         sys.modules[name] = types.ModuleType(name)
-    for name in ['dmx', 'kv2', 'vmapedit', 'lighting', 'visfit', 'probes']:
+    for name in ['dmx', 'kv2', 'vmapedit', 'lighting', 'visfit', 'probes', 'splitfaces']:
         mod = sys.modules[name]
         if getattr(mod, '_bundled', False): continue
         mod.__file__ = __file__; mod._bundled = True
@@ -235,6 +248,251 @@ def dir_to_ang(d):
 
 def fmt(x):
     return ('%.6f' % x).rstrip('0').rstrip('.') if x != int(x) else '%d' % int(x)
+
+
+# ======================================================================= physics prop names (for push_mass.js)
+PROP_CLASSES = ('prop_physics', 'prop_physics_override')
+MASS_TAG = '__pm'                       # <name>__pm<mass>, a decimal point is written as p (12.5 -> 12p5)
+MANUAL_RE = re.compile(r'^push_\d+(?:\.\d+)?_', re.I)
+TAG_RE = re.compile(re.escape(MASS_TAG) + r'(\d+(?:p\d+)?)$', re.I)
+NO_REF_KEYS = {'targetname', 'classname', 'model', 'message', 'globalname', 'vscripts', 'description', 'origin', 'angles'}
+UNNAMED_BASE = 'physprop'
+
+
+def mass_text(x):
+    r = round(x, 1)
+    return ('%d' % r) if r == int(r) else ('%.1f' % r).replace('.', 'p')
+
+
+def find_ci(root, rel):
+    """rel (forward slashes) under root, matching each folder / file name case-insensitively -> path or None"""
+    cur = root
+    for part in rel.replace('\\', '/').split('/'):
+        if not part:
+            continue
+        nxt = os.path.join(cur, part)
+        if not os.path.exists(nxt):
+            try:
+                hit = next((f for f in os.listdir(cur) if f.lower() == part.lower()), None)
+            except OSError:
+                return None
+            if hit is None:
+                return None
+            nxt = os.path.join(cur, hit)
+        cur = nxt
+    return cur if os.path.isfile(cur) else None
+
+
+def phy_mass(path):
+    """total mass in a Source 1 .phy: the sum of the "mass" of every solid in its trailing keyvalues text"""
+    try:
+        txt = open(path, 'rb').read().decode('latin-1')
+    except OSError:
+        return None
+    vals = re.findall(r'"mass"\s+"([-+0-9.eE]+)"', txt)
+    try:
+        tot = sum(float(v) for v in vals)
+    except ValueError:
+        return None
+    return tot if vals and tot > 0 else None
+
+
+class PropNames:
+    """Rename every prop_physics / prop_physics_override to <name>__pm<mass> (mass from the Source 1 model's .phy x massscale), so
+    push_mass.js can read the mass from the name.  Everything that refers to the old name follows: outputs aimed at it, point_template
+    Template slots, parentname / target and other keyvalues that equal it.  A name shared by props of different masses becomes one
+    name per mass: outputs are copied once per new name and a point_template gets one slot per new name."""
+
+    def __init__(self, rb, roots):
+        self.rb, self.m, self.roots = rb, rb.m, roots
+        self.rep = []                      # report lines
+        self.cache = {}
+
+    def model_mass(self, model):
+        if model in self.cache:
+            return self.cache[model]
+        rel = re.sub(r'\.vmdl(_c)?$', '', model.replace('\\', '/'), flags=re.I) + '.phy'
+        res = None
+        for r in self.roots:
+            f = find_ci(r, rel)
+            if f:
+                res = (phy_mass(f), f)
+                break
+        self.cache[model] = res
+        return res
+
+    def vmf_massscale(self, e):
+        idx = getattr(self, '_vidx', None)
+        if idx is None:
+            idx = self._vidx = {}
+            for ve in self.rb.v:
+                kv = ve['kv']
+                if kv.get('classname', '').lower() in PROP_CLASSES and kv.get('origin'):
+                    try:
+                        o = tuple(round(float(x)) for x in kv['origin'].split()[:3])
+                    except ValueError:
+                        continue
+                    idx.setdefault((o, kv.get('model', '').lower()), kv)
+        o = tuple(round(x) for x in self.m.origin(e))
+        kv = idx.get((o, self.m.P(e, 'model', '').lower().replace('.vmdl', '.mdl')))
+        if kv and kv.get('massscale'):
+            try:
+                return float(kv['massscale'])
+            except ValueError:
+                pass
+        return None
+
+    def run(self, keep_manual=True):
+        m, rb = self.m, self.rb
+        props = m.by_class(*PROP_CLASSES)
+        if not props:
+            return
+        plan, nomass, manual, same = {}, {}, [], 0      # node -> (old, new)
+        for e in props:
+            old = m.name(e)
+            model = m.P(e, 'model', '')
+            if old and MANUAL_RE.match(old) and keep_manual:
+                manual.append((old, model))
+                continue
+            got = self.model_mass(model) if model else None
+            if not got or not got[0]:
+                nomass.setdefault(model or '(no model)', []).append(old or '(unnamed)')
+                continue
+            ms = None
+            for k in ('massScale', 'massscale'):
+                v = m.P(e, k, '')
+                if v.strip():
+                    try:
+                        ms = float(v)
+                    except ValueError:
+                        pass
+                    break
+            if ms is None:
+                ms = self.vmf_massscale(e)
+            mass = got[0] * (ms if ms is not None and ms > 0 else 1.0)       # massscale 0 (the FGD default) = no scaling
+            if mass <= 0:
+                nomass.setdefault(model, []).append(old or '(unnamed)')
+                continue
+            base = MANUAL_RE.sub('', TAG_RE.sub('', old)) if old else UNNAMED_BASE
+            base = base or UNNAMED_BASE
+            new = base + MASS_TAG + mass_text(mass)
+            if new == old:
+                same += 1
+                continue
+            plan[e] = (old, new, model, mass)
+        # old name (lower) -> ordered distinct new names
+        name_map = {}
+        for e, (old, new, model, mass) in plan.items():
+            if old:
+                lst = name_map.setdefault(old.lower(), [])
+                if new not in lst:
+                    lst.append(new)
+        for e, (old, new, model, mass) in plan.items():
+            m.setp(e, 'targetname', new)
+        present = {m.name(e).lower() for e in m.entities() if m.name(e)}       # names still in use after renaming
+        n_ret = n_dup = n_ref = n_tpl = 0
+        ambiguous, wild = [], []
+        # outputs aimed at a renamed prop
+        for src in m.entities():
+            arr = m.g(src, b'connectionsData') or []
+            for ci in list(arr):
+                c = m.E[ci]
+                tn = dmx_get(c, b'targetName').decode('utf-8', 'replace')
+                tl = tn.lower()
+                if tl in name_map:
+                    news = name_map[tl]
+                    keep_old = tl in present
+                    first = 0 if keep_old else 1
+                    if not keep_old:
+                        dmx_set(c, b'targetName', news[0].encode())
+                        n_ret += 1
+                    for nn in news[first:]:
+                        dup = m.new_el(c['type'], [[a[0], a[1], (list(a[2]) if isinstance(a[2], list) else a[2])] for a in c['attrs']])
+                        dmx_set(m.E[dup], b'targetName', nn.encode())
+                        dmx_geta(m.E[src], b'connectionsData')[2].append(dup)
+                        n_dup += 1
+                elif '*' in tn:
+                    import fnmatch
+                    hit = [o for o in name_map if fnmatch.fnmatchcase(o, tl)]
+                    if hit and not all(fnmatch.fnmatchcase(nn.lower(), tl) for o in hit for nn in name_map[o]):
+                        wild.append('%s -> "%s"' % (m.name(src) or m.cls(src), tn))
+        # point_template slots and other keyvalues that name a renamed prop
+        for ent in m.entities():
+            if m.cls(ent) == 'point_template':
+                slots = [(k, v) for k, v in self.keyvals(ent) if re.fullmatch(r'Template\d+', k)]
+                cur = [v for _k, v in slots if v]
+                if not any(v.lower() in name_map for v in cur):
+                    continue
+                out = []
+                for v in cur:
+                    if v.lower() in name_map:
+                        if v.lower() in present:
+                            out.append(v)
+                        for nn in name_map[v.lower()]:
+                            if nn not in out:
+                                out.append(nn)
+                    elif v not in out:
+                        out.append(v)
+                if len(out) > len(slots):
+                    self.rep.append('WARNING point_template "%s" needs %d Template slots but has %d: the extra names are not spawned' % (m.name(ent), len(out), len(slots)))
+                    out = out[:len(slots)]
+                for i, (k, _v) in enumerate(slots):
+                    m.setp(ent, k, out[i] if i < len(out) else '')
+                n_tpl += 1
+                continue
+            for k, v in self.keyvals(ent):
+                if not v or k.lower() in NO_REF_KEYS:
+                    continue
+                vl = v.lower()
+                if vl in name_map and vl not in present:
+                    news = name_map[vl]
+                    m.setp(ent, k, news[0])
+                    n_ref += 1
+                    if len(news) > 1:
+                        ambiguous.append('%s.%s = "%s" now "%s" (the name was shared by props of different mass)' % (m.name(ent) or m.cls(ent), k, v, news[0]))
+        # report
+        by_old = {}
+        for e, (old, new, model, mass) in plan.items():
+            by_old.setdefault((old, new), []).append((model, mass))
+        for (old, new), lst in sorted(by_old.items()):
+            self.rep.append('%s -> %s   x%d   %s   mass %g' % (old or '(unnamed)', new, len(lst), lst[0][0], lst[0][1]))
+        rb.log.append('physics props: %d renamed to <name>%s<mass> (%d already had the right name); %d outputs retargeted, %d copied for names split by mass; %d point_template lists and %d other keyvalues updated' % (
+            len(plan), MASS_TAG, same, n_ret, n_dup, n_tpl, n_ref))
+        if manual:
+            rb.log.append('%d props already have a push_<mass>_ name (kept as you set them; --props-override-manual to rename them too)' % len(manual))
+        if nomass:
+            rb.todo.append('%d prop models have no .phy under the Source 1 folders (pass --source1 DIR), so their props were not renamed: %s' % (
+                len(nomass), ', '.join('%s (%d)' % (k, len(v)) for k, v in list(nomass.items())[:6])))
+        if wild:
+            rb.todo.append('outputs aimed at a wildcard name that no longer matches every renamed prop (%d): %s' % (len(wild), '; '.join(wild[:5])))
+        if ambiguous:
+            rb.todo.append('%d keyvalues pointed at a name shared by props of different mass, they now point at the first: %s' % (len(ambiguous), '; '.join(ambiguous[:5])))
+        for line in self.rep:
+            if line.startswith('WARNING'):
+                rb.todo.append(line)
+
+    def keyvals(self, ent):
+        """(key, string value) of every string property of an entity"""
+        out = []
+        for a in self.m.props(ent)['attrs']:
+            if a[1] == 5 and isinstance(a[2], (bytes, bytearray)):
+                out.append((a[0].decode('utf-8', 'replace'), a[2].decode('utf-8', 'replace')))
+        return out
+
+
+def dmx_get(el, k):
+    import dmx
+    return dmx.get(el, k)
+
+
+def dmx_set(el, k, v):
+    import dmx
+    dmx.set_(el, k, dmx.T_STR, v)
+
+
+def dmx_geta(el, k):
+    import dmx
+    return dmx.geta(el, k)
 
 
 class Rebuild:
@@ -433,9 +691,25 @@ class Rebuild:
             self.log.append('%d underwater light_omni2 (%d lumens, range 512, no shadows) added in %d of %d water volumes' % (added, round(lum), used, len(waters)))
             self.todo.append('underwater lights are a heuristic (sparse grid, no light within 640 units); check the water areas and tune with --light-scale or delete them')
 
+    # -------------------------------------------------- 7. large faces (split)
+    def split_faces(self):
+        import splitfaces
+        a = self.a
+        notes = []
+        skip_mat = ('materials/tools/', 'toolsnodraw', 'sky', 'moondome')
+        res = splitfaces.split_large(self.m, a.large_face_area, a.face_tile, a.split_large_faces, skip_mat, notes)
+        self.split_notes = notes + ['NOT SPLIT: ' + x for x in res['skipped']]
+        if res['faces']:
+            self.log.append('split %d large face(s) in %d mesh(es) into %d pieces on a %g grid%s; area preserved, T-junctions repaired' % (
+                res['faces'], res['meshes'], res['pieces'], a.face_tile, ', %d new mesh(es)' % res['new_meshes'] if res['new_meshes'] else ''))
+            self.todo.append('split faces: check the cut floors / ramps for seams or lightmap-density changes after the bake (new vertices are interpolated, UVs follow the world-aligned texture axes)')
+        if res['skipped']:
+            self.todo.append('%d large face(s) could not be split (displacement meshes, rotated meshes or non-convex faces): see "large faces split" below' % len(res['skipped']))
+
     # -------------------------------------------------- large faces (report only)
     def large_faces(self):
-        """Lists very large lit faces: one face is one lightmap chart, so a huge floor can bake blotchy.  Changes nothing."""
+        """Lists the very large lit faces that are left (all of them when splitting is off): one face is one lightmap chart,
+        so a huge floor can bake blotchy.  Changes nothing."""
         import numpy as np
         import lighting as skl
         m, limit = self.m, self.a.large_face_area
@@ -467,7 +741,7 @@ class Rebuild:
                 for i in range(1, len(P) - 1):
                     nrm += np.cross(P[i] - P[0], P[i + 1] - P[0])
                 area = float(np.linalg.norm(nrm) / 2)
-                if area < limit:
+                if area <= limit * 1.0001:          # a 512 x 512 tile is fine
                     continue
                 name = mat.split('/')[-1].rsplit('.', 1)[0]
                 why = None
@@ -485,10 +759,13 @@ class Rebuild:
         for key, (tot, n, big, at) in sorted(groups.items(), key=lambda kv: -kv[1][2]):
             self.faces_report.append('%-22s %-34s %3d face(s), largest %9d sq units, at %s' % (key[0], key[1][:34], n, big, at))
         if groups:
-            self.todo.append('%d groups of very large lit faces (over %d sq units, one lightmap chart each): see "large faces" below; split a face only if its bake looks blotchy' % (len(groups), limit))
+            if self.a.split_large_faces == 'off':
+                self.todo.append('%d groups of very large lit faces (over %d sq units, one lightmap chart each): see "large faces remaining" below; if a bake looks blotchy, run with --split-large-faces meshes or split them in Hammer' % (len(groups), limit))
+            else:
+                self.todo.append('%d groups of very large lit faces could not be split (over %d sq units, one lightmap chart each): see "large faces remaining" below; split them in Hammer only if their bake looks blotchy' % (len(groups), limit))
         self.faces_ignored = ['%-22s %-34s %3d face(s), largest %9d sq units: %s' % (k[0], k[1][:34], v[1], v[2], k[2]) for k, v in sorted(ignored.items(), key=lambda kv: -kv[1][2])]
 
-    # -------------------------------------------------- 5. fix lights the lighting pass added
+    # -------------------------------------------------- 6. fix lights the lighting pass added
     def normalise_added(self):
         m = self.m
         mine = set(self.new)
@@ -537,13 +814,18 @@ def main():
     ap.add_argument('--light-scale', type=float, default=1.0, help='multiply the brightness of every recreated light (default 1)')
     ap.add_argument('--sun-scale', type=float, default=1.0, help='multiply the light_environment brightness (default 1)')
     ap.add_argument('--no-underwater', action='store_true', help='do not add lights inside water volumes')
-    ap.add_argument('--large-face-area', type=float, default=262144.0, help='report lit faces larger than this many square units (default 262144 = 512 x 512); nothing is changed')
+    ap.add_argument('--large-face-area', type=float, default=262144.0, help='lit faces larger than this many square units are split (see --split-large-faces) and any left over are reported (default 262144 = 512 x 512)')
+    ap.add_argument('--split-large-faces', choices=('off', 'faces', 'meshes'), default='meshes', help='cut lit faces over --large-face-area on a world grid (T-junctions repaired): "faces" keeps one mesh, "meshes" (default) also moves the pieces into one mesh per tile so each gets its own cubemap / probe; "off" only reports')
+    ap.add_argument('--face-tile', type=float, default=512.0, help='grid size for --split-large-faces (default 512)')
     ap.add_argument('--exposure', type=float, nargs=2, metavar=('MIN', 'MAX'), help='set post_processing_volume min / max exposure')
     ap.add_argument('--skip-passes', action='store_true', help='do not run the probe / stationary light / vis passes')
     ap.add_argument('--skip-probes', action='store_true')
     ap.add_argument('--skip-lights', action='store_true', help='do not switch lights to Stationary')
     ap.add_argument('--skip-vis', action='store_true')
     ap.add_argument('--all-lower', action='store_true', help='vis: Lower hints instead of Low (for a vis compile that stalls)')
+    ap.add_argument('--source1', action='append', default=[], metavar='DIR', help='Source 1 folder that holds models\\... (repeat for several): the .phy files give each prop_physics its mass. The vmf folder and its parent are tried too')
+    ap.add_argument('--skip-props', action='store_true', help='do not rename physics props for push_mass.js')
+    ap.add_argument('--props-override-manual', action='store_true', help='also rename props that already have a push_<mass>_ name')
     a = ap.parse_args()
 
     if a.restore:
@@ -582,6 +864,11 @@ def main():
         rb.sun()
         if not a.no_underwater:
             rb.underwater()
+        if not a.skip_props:
+            roots = [os.path.abspath(r) for r in a.source1] + [os.path.dirname(os.path.abspath(vmf)), os.path.dirname(os.path.dirname(os.path.abspath(vmf)))]
+            pn = PropNames(rb, roots)
+            pn.run(keep_manual=not a.props_override_manual)
+            rb.prop_report = pn.rep
         if a.exposure:
             for e in m.by_class('post_processing_volume'):
                 m.setp(e, 'minexposure', fmt(a.exposure[0]))
@@ -599,6 +886,9 @@ def main():
                 print('running %s...' % name, flush=True)
                 fn()
             rb.normalise_added()
+        if a.split_large_faces != 'off':
+            print('splitting large faces...', flush=True)
+            rb.split_faces()
         rb.large_faces()
         rb.log.append('removed %d orphaned elements' % m.prune())
     except Exception:
@@ -611,7 +901,11 @@ def main():
     if bk:
         lines += ['backup: %s' % bk, 'undo:   py rebuild_lighting.py "%s" --restore "%s"' % (a.vmap, bk)]
     lines += ['', 'changes:'] + ['  - ' + x for x in rb.log] + ['', 'check in game:'] + ['  - ' + x for x in rb.todo]
-    lines += ['', 'large faces (reported only, nothing was changed; over %d sq units, each is one lightmap chart):' % a.large_face_area] + ['  - ' + x for x in rb.faces_report]
+    if getattr(rb, 'prop_report', None):
+        lines += ['', 'physics prop names (old -> new, count, model, mass):'] + ['  - ' + x for x in rb.prop_report]
+    if getattr(rb, 'split_notes', None):
+        lines += ['', 'large faces split (%s):' % a.split_large_faces] + ['  - ' + x for x in rb.split_notes]
+    lines += ['', 'large faces remaining (reported only, nothing was changed; over %d sq units, each is one lightmap chart):' % a.large_face_area] + ['  - ' + x for x in rb.faces_report]
     lines += ['', 'large faces that are probably fine:'] + ['  - ' + x for x in rb.faces_ignored]
     rep = out + '.lightlog.txt'
     with open(rep, 'w', encoding='utf-8') as f:
