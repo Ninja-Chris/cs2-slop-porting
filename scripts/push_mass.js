@@ -1,4 +1,15 @@
-// push_mass.js (v7): make player pushes on physics props scale with prop mass.
+// push_mass.js (v8): make player pushes on physics props scale with prop mass, and (new in v8)
+// let players' weight tip func_physbox balance plates.
+//
+// v8 changes
+// - func_physbox / func_physbox_multiplayer can be pushed too. Their mass comes from the name, which
+//   vmap_asset_slop_import.py now writes for physboxes as well (push_<mass>_<name>), or from PHYSBOX_MASS below.
+// - Balance plates get a weight tag from the importer: push_<mass>_w<x>x<y>x<z>[a]_<name> (size in units;
+//   "a" = only after RunScriptInput arm_<full name>, which the importer adds next to the plate's EnableMotion).
+// - NEW weight pass: a player standing on an entry with weight: true in PHYSBOX_MASS presses it down
+//   with REF_MASS of weight at their feet, so off-centre players tilt it (torque about its centre).
+//   v7 only did horizontal pushes and deliberately ignored players standing on top.
+// - The weight pass is UNTESTED in game. See WEIGHT_* below; DEBUG_WEIGHT prints what it applies.
 //
 // Runs inside the map via a point_script entity, so no server plugin is needed.
 // The core push is the v3 push, which was confirmed working in-game. CONTACT_GRACE
@@ -60,6 +71,45 @@ const MIN_INTO_SPEED = 20;
 // Props already moving faster than this are assumed hit by an explosion or
 // bullet, and are left to the engine.
 const MAX_EXTERNAL_SPEED = 400;
+
+// ---- func_physbox masses (v8) ----
+// CS2 doesn't expose a physbox's mass to scripts, so it is listed here by entity name.
+//   mass   - kg, compared against REF_MASS (85 = one player)
+//   size   - [x, y, z] extent in units in the entity's own axes (for rotational inertia). Optional.
+//   weight - true: players standing on it press it down at their feet (balance plates)
+//   push   - false: no horizontal player push (balance plates on a pin would be shoved off it)
+//   arm    - "auto": weight works whenever the plate exists. "input": weight only works after the
+//            point_script gets RunScriptInput arm_<name> (send it at the same time as the plate's
+//            EnableMotion); it is disarmed again on round start. Use "input" if the plate tilts while
+//            it is still motion-disabled.
+// mg_hellz mg4 disks: 1024x1024x8 plates resting on an 8x8 pin, massScale 0.2 in CS:GO. Source 1
+// capped a brush's physics mass at 50000, times 0.2 = 10000 (estimate: tune with WEIGHT_GAIN).
+// Not needed for maps converted by vmap_asset_slop_import.py (the names carry this); use it for hand-made
+// maps or to override a converted plate. Example:
+//   mg4_disk_t: { mass: 10000, size: [1024, 1024, 8], weight: true, push: false, arm: "auto" },
+const PHYSBOX_MASS = {};
+const PHYSBOX_CLASSES = ["func_physbox", "func_physbox_multiplayer"];
+
+// ---- Player weight on balance plates (v8, UNTESTED) ----
+const WEIGHT_ON = true;
+// World gravity in units/s^2 (sv_gravity).
+const GRAVITY = 800;
+// Multiplier on the player's weight. 1 = one REF_MASS player at full gravity. Raise if plates tip too
+// slowly compared with CS:GO, lower if too fast.
+const WEIGHT_GAIN = 1;
+// Also push the plate straight down (on a pin or in water the engine turns this into tilt / sinking).
+const WEIGHT_LINEAR = true;
+// Tilt speed cap in radians per second (the engine still adds its own gravity tilt on top).
+const MAX_TILT_SPIN = 1.5;
+// Angular velocity units the engine uses for Teleport/GetAbsAngularVelocity. Source uses degrees per
+// second; if plates spin ~57x too fast or barely at all, flip this.
+const ANGVEL_DEGREES = true;
+// How far below the feet (units) to look for the plate when the engine doesn't report it as the ground entity.
+const GROUND_TRACE = 6;
+// Fallback k^2 (units^2) for weight entries without a size: I = mass * k^2 on every axis.
+const WEIGHT_K2_DEFAULT = 2700;
+// Print the weight each plate gets, about twice a second.
+const DEBUG_WEIGHT = false;
 
 // ---- Smoothing (EXPERIMENTAL, off) ----
 // Ramp the prop's speed toward its target instead of setting it directly.
@@ -161,6 +211,30 @@ function massFromName(name) {
     return m ? Number(m[1]) : undefined;
 }
 
+function isProp(cls) {
+    return cls === "prop_physics" || cls === "prop_physics_override";
+}
+function isPhysbox(cls) {
+    return PHYSBOX_CLASSES.includes(cls);
+}
+// Table entry for a physbox (name with any template "&0001" fixup removed), else what its name tag says, or undefined.
+const WEIGHT_TAG_RE = /^push_(\d+(?:\.\d+)?)_w(\d+)x(\d+)x(\d+)(a?)_/;
+function physboxInfo(name) {
+    const n = name.replace(/&\d+$/, "");
+    if (PHYSBOX_MASS[n]) return PHYSBOX_MASS[n];
+    const m = WEIGHT_TAG_RE.exec(n);
+    if (!m) return undefined;
+    return { mass: Number(m[1]), size: [Number(m[2]), Number(m[3]), Number(m[4])], weight: true, push: false, arm: m[5] ? "input" : "auto" };
+}
+// Mass of a pushable entity, or undefined if the script should leave it alone.
+function massOf(ent, cls, name) {
+    if (isProp(cls)) return massFromName(name);
+    if (!isPhysbox(cls)) return undefined;
+    const info = physboxInfo(name);
+    if (info) return info.push === false ? undefined : info.mass;
+    return massFromName(name);
+}
+
 // True only if the prop is being pushed into a wall / static object, not into
 // another movable prop and not into open space.
 function isWallAhead(prop, px, py, pawn) {
@@ -175,7 +249,7 @@ function isWallAhead(prop, px, py, pawn) {
     const e = tr.hitEntity;
     if (!e || e.IsWorld()) return true;
     const c = e.GetClassName();
-    return !(c === "prop_physics" || c === "prop_physics_override" || c === "prop_physics_multiplayer");
+    return !(c === "prop_physics" || c === "prop_physics_override" || c === "prop_physics_multiplayer" || isPhysbox(c));
 }
 
 // Give props that share a name (template-spawned copies) a unique name, e.g. z10props__pm120
@@ -207,10 +281,34 @@ function renameNewProps() {
     }
 }
 
-Instance.OnRoundStart(() => renameNewProps());
+// Plates with arm: "input" only take weight after RunScriptInput arm_<name>; disarm_<name> stops it.
+// Names come from PHYSBOX_MASS and from the physboxes in the map (importer weight tags).
+const armed = new Set();
+const armInputs = new Set();
+function registerArmInputs() {
+    const names = Object.keys(PHYSBOX_MASS);
+    for (const cls of PHYSBOX_CLASSES) for (const ent of Instance.FindEntitiesByClass(cls)) names.push(ent.GetEntityName().replace(/&\d+$/, ""));
+    for (const pname of names) {
+        const info = physboxInfo(pname);
+        if (!info || !info.weight || info.arm !== "input" || armInputs.has(pname)) continue;
+        armInputs.add(pname);
+        Instance.OnScriptInput(`arm_${pname}`, () => armed.add(pname));
+        Instance.OnScriptInput(`disarm_${pname}`, () => armed.delete(pname));
+    }
+}
+try {
+    registerArmInputs(); // entities may not exist yet at load; OnActivate / OnRoundStart register them again
+} catch (e) {}
+
+Instance.OnRoundStart(() => {
+    armed.clear();
+    registerArmInputs();
+    renameNewProps();
+});
 
 Instance.OnActivate(() => {
     Instance.Msg("push_mass: script activated");
+    registerArmInputs();
     renameNewProps();
     lastTime = Instance.GetGameTime();
     Instance.SetThink(tick);
@@ -230,7 +328,7 @@ Instance.OnBeforePlayerDamage((event) => {
         );
     }
 
-    if (!valid || massFromName(name) === undefined) return;
+    if (!valid || massOf(inf, inf.GetClassName(), name) === undefined) return;
 
     if (NO_SELF_PUSH_DAMAGE) {
         const ps = propState.get(name);
@@ -255,6 +353,120 @@ Instance.OnBeforePlayerDamage((event) => {
     }
 });
 
+// ---- Weight pass (v8) ----
+// Source QAngle -> the entity's local axes in world space (forward = local x, left = local y, up = local z).
+function axes(a) {
+    const d = Math.PI / 180;
+    const sp = Math.sin(a.pitch * d), cp = Math.cos(a.pitch * d);
+    const sy = Math.sin(a.yaw * d), cy = Math.cos(a.yaw * d);
+    const sr = Math.sin(a.roll * d), cr = Math.cos(a.roll * d);
+    const f = { x: cp * cy, y: cp * sy, z: -sp };
+    const r = { x: -sr * sp * cy + cr * sy, y: -sr * sp * sy - cr * cy, z: -sr * cp };
+    const u = { x: cr * sp * cy + sr * sy, y: cr * sp * sy - sr * cy, z: cr * cp };
+    return [f, { x: -r.x, y: -r.y, z: -r.z }, u];
+}
+const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+let nextWeightMsg = 0;
+const weightState = new Map(); // plate name -> { w: angular velocity last written, t: time }
+let readScale = 1;
+
+// Every player standing on a weight plate gives it an impulse of (player weight * dt) straight down at
+// their feet: the plate's velocity changes by J / mass and its spin by I^-1 (r x J), r measured from the
+// plate's origin (its centre in a converted map). A centred player only presses down; an off-centre one tilts it.
+function applyWeight(dt, now) {
+    const plates = new Map(); // name -> { ent, info, feet: [] }
+    for (let slot = 0; slot < 64; slot++) {
+        const controller = Instance.GetPlayerController(slot);
+        const pawn = controller ? controller.GetPlayerPawn() : undefined;
+        if (!pawn || !pawn.IsAlive()) continue;
+        // What the player stands on: the engine's ground entity, or (if that is not a physbox, e.g. CS2 does not report physics
+        // objects as ground) a short trace down from the feet.
+        let ground = pawn.GetGroundEntity();
+        if (!ground || !ground.IsValid() || !isPhysbox(ground.GetClassName())) {
+            const vz = pawn.GetAbsVelocity().z;
+            if (Math.abs(vz) > 60) continue; // jumping / falling
+            const o = pawn.GetAbsOrigin();
+            const tr = Instance.TraceLine({ start: { x: o.x, y: o.y, z: o.z + 4 }, end: { x: o.x, y: o.y, z: o.z - GROUND_TRACE }, ignoreEntity: pawn, ignorePlayers: true });
+            ground = tr.didHit && !tr.startedInSolid ? tr.hitEntity : undefined;
+            if (!ground || !ground.IsValid() || ground.IsWorld() || !isPhysbox(ground.GetClassName())) continue;
+        }
+        const name = ground.GetEntityName().replace(/&\d+$/, "");
+        const info = physboxInfo(name);
+        if (!info || !info.weight) continue;
+        if (info.arm === "input" && !armed.has(name)) continue;
+        let p = plates.get(name);
+        if (!p) plates.set(name, (p = { ent: ground, info, feet: [] }));
+        p.feet.push(pawn.GetAbsOrigin());
+    }
+
+    const debug = DEBUG_WEIGHT && now >= nextWeightMsg;
+    if (debug) nextWeightMsg = now + 0.5;
+
+    for (const [name, { ent, info, feet }] of plates) {
+        const m = info.mass;
+        const j = REF_MASS * WEIGHT_GAIN * GRAVITY * dt; // impulse per player, kg*u/s, pointing down
+        const c = ent.GetAbsOrigin();
+        // Torque impulse (r x J) with J = (0, 0, -j): (-ry*j, rx*j, 0)
+        const tq = { x: 0, y: 0, z: 0 };
+        for (const f of feet) {
+            tq.x += -(f.y - c.y) * j;
+            tq.y += (f.x - c.x) * j;
+        }
+        // Spin change = I^-1 * torque, with I diagonal in the plate's own axes.
+        const ax = axes(ent.GetAbsAngles());
+        let I;
+        if (info.size) {
+            const [sx, sy, sz] = info.size;
+            I = [(m * (sy * sy + sz * sz)) / 12, (m * (sx * sx + sz * sz)) / 12, (m * (sx * sx + sy * sy)) / 12];
+        } else {
+            I = [m * WEIGHT_K2_DEFAULT, m * WEIGHT_K2_DEFAULT, m * WEIGHT_K2_DEFAULT];
+        }
+        const dw = { x: 0, y: 0, z: 0 }; // rad/s, world axes
+        for (let k = 0; k < 3; k++) {
+            const wl = dot(tq, ax[k]) / I[k];
+            dw.x += ax[k].x * wl;
+            dw.y += ax[k].y * wl;
+            dw.z += ax[k].z * wl;
+        }
+        const unit = ANGVEL_DEGREES ? 180 / Math.PI : 1;
+        const w0 = ent.GetAbsAngularVelocity();
+        // The spin read back is compared with what was written last tick: if the engine reports it in other units than it takes
+        // (degrees vs radians, a factor of ~57), the read is rescaled, otherwise every tick would throw most of the tilt away.
+        const st = weightState.get(name);
+        if (st && now - st.t < 0.1 && readScale === 1) {
+            const wr = Math.hypot(st.w.x, st.w.y), rr = Math.hypot(w0.x, w0.y);
+            if (wr > 1e-3 && rr > 0) {
+                const q = rr / wr;
+                if (q > 30 && q < 120) readScale = 1 / 57.2958;
+                else if (q > 1 / 120 && q < 1 / 30) readScale = 57.2958;
+                if (readScale !== 1) Instance.Msg(`push_mass: angular velocity is read back in other units than it is set; rescaling reads by ${readScale.toFixed(4)}`);
+            }
+        }
+        let w = { x: (w0.x * readScale) / unit + dw.x, y: (w0.y * readScale) / unit + dw.y, z: (w0.z * readScale) / unit + dw.z };
+        // Cap the tilt (spin about horizontal axes) without touching any yaw spin.
+        const tilt = Math.hypot(w.x, w.y);
+        if (tilt > MAX_TILT_SPIN) {
+            w.x *= MAX_TILT_SPIN / tilt;
+            w.y *= MAX_TILT_SPIN / tilt;
+        }
+        const angularVelocity = { x: w.x * unit, y: w.y * unit, z: w.z * unit };
+        weightState.set(name, { w: angularVelocity, t: now });
+        if (WEIGHT_LINEAR) {
+            const v = ent.GetAbsVelocity();
+            const velocity = { x: v.x, y: v.y, z: v.z - (j * feet.length) / m };
+            ent.Teleport({ velocity, angularVelocity });
+        } else {
+            ent.Teleport({ angularVelocity });
+        }
+        if (debug) {
+            Instance.Msg(
+                `weight ${name}: players ${feet.length}, spin read ${w0.x.toFixed(2)} ${w0.y.toFixed(2)} ${w0.z.toFixed(2)}, ` +
+                    `added ${(dw.x * unit).toFixed(3)} ${(dw.y * unit).toFixed(3)} ${(dw.z * unit).toFixed(3)} (${ANGVEL_DEGREES ? "deg" : "rad"}/s)`,
+            );
+        }
+    }
+}
+
 function tick() {
     const now = Instance.GetGameTime();
     const dt = Math.min(Math.max(now - lastTime, 0.001), 0.1);
@@ -264,6 +476,8 @@ function tick() {
         nextScan = now + SCAN_INTERVAL;
         renameNewProps();
     }
+
+    if (WEIGHT_ON) applyWeight(dt, now);
 
     // Every player pushing the same prop is collected first, then each prop is pushed once with their combined effect.
     const groups = new Map();
@@ -321,8 +535,8 @@ function tick() {
 
         const cls = prop.GetClassName();
         const name = prop.GetEntityName();
-        const mass = massFromName(name);
-        if ((cls !== "prop_physics" && cls !== "prop_physics_override") || mass === undefined) {
+        const mass = massOf(prop, cls, name);
+        if (mass === undefined) {
             state.delete(slot);
             continue;
         }
