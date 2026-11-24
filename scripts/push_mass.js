@@ -1,5 +1,41 @@
-// push_mass.js (v8): make player pushes on physics props scale with prop mass, and (new in v8)
-// let players' weight tip func_physbox balance plates.
+// push_mass.js (v12): v12 adds CS:GO's 2000 u/s cap on physics objects (capSpeeds, end of file).
+// push_mass.js (v11): make player pushes on physics props scale with prop mass, and let players' weight tip
+// func_physbox balance plates.
+//
+// v11: pushes follow CS:GO's player physics box (Source 1 vphysics player controller + CBasePlayer, with
+// cs_enable_player_physics_box 1). CSGO_PUSH = false gives v10's pushes. The weight pass is unchanged.
+// - Running into a prop: the player's 85 kg box hits it at the player's speed. The impact is inelastic (the "player"
+//   surfaceprop's elasticity is 0.001), so the prop gets the impulse of an 85 kg body stopping against it, any mass.
+// - Pushing while touching: the box is steered half-way toward where the player wants to go each tick, and the
+//   controller caps its speed into anything it touches at 50 u/s (SetPushSpeedLimit(50)), or 0 for anything over 350 kg
+//   (SetPushMassLimit(350)). The box keeps pressing the prop at that speed; the prop's own floor friction decides how
+//   fast it actually goes. Light props end up near 50 u/s (about 43 walking, 28 crouched), heavy ones slower.
+// - Several players: each box pushes in turn. Off-centre pushes spin the prop about its yaw (a real angular velocity,
+//   so it keeps turning after the push).
+//
+// v10: player weight on plates follows CS:GO's player physics box (read from Source 1's vphysics player controller;
+// cs_enable_player_physics_box 1). Nothing else changed.
+// - Standing still (no movement keys): the controller is off and the 85 kg player box rests on the plate as a normal
+//   physics object -> 1 x weight (as v9).
+// - Moving (movement keys held) on a plate within ~8 degrees of level: the controller leaves the box's vertical speed
+//   alone (gravity still acts) and also adds one tick of gravity itself while touching ground -> 2 x weight.
+// - Moving on a plate tilted further than that: the contact is no longer "floor" (normal z above -0.99) and the push
+//   limit (350 kg) removes the box's speed into anything heavier -> about 0.
+// - Landing: the box hits the plate at its fall speed -> one impulse of 85 x fall speed (not when moving on a tilted plate).
+// CSGO_WEIGHT_RULES = false gives v9's 1 x weight for everyone on a plate.
+//
+// v9 fixes (nothing else changed)
+// - Plates / physboxes / props that share a name are kept apart: a player on one same-named plate no longer tips another one,
+//   and two same-named physboxes pushed at once both move (v8 merged them by name and moved only the first).
+// - The angular-velocity unit guess is gone: when a plate stopped (hit its rest, the floor), the spin read back was ~1/57 of what
+//   was written, v8 took that for a unit mismatch and scaled every later read by 57, spinning plates up to MAX_TILT_SPIN.
+//   Reads and writes now use the same units (ANGVEL_DEGREES).
+// - Standing on a plate is found with the player's footprint (as CS:GO's ground check), not a line from the centre, so a player
+//   near a plate's edge counts; and a player riding a plate that tips fast still counts (v8 dropped anyone moving faster than
+//   60 u/s vertically, so the weight cut out mid-tilt). Only a player jumping up (rising faster than 140) is off it.
+// - A player no longer pushes the prop / physbox they are standing on (CS:GO's player ignores its ground entity when touching
+//   physics objects: CBasePlayer::Touch). Standing on a tilted prop could push it along under them.
+// - Keeps running after a tools-mode save (OnScriptReload).
 //
 // v8 changes
 // - func_physbox / func_physbox_multiplayer can be pushed too. Their mass comes from the name, which
@@ -50,7 +86,20 @@
 //    (e.g. "push_5_ball1"). Props without either are left alone.
 // 4. Rotation assumes the prop's origin is near its horizontal centre.
 
-import { Instance } from "cs_script/point_script";
+import { Instance, CSInputs } from "cs_script/point_script";
+// CS2 now refuses a second SetThink ("Callback \"Think\" already registered"): the think is set once (a script reload re-runs
+// this file, so it is set again then)
+let thinkSetTo = null;
+function setThinkOnce(fn) {
+    if (thinkSetTo === fn) return;
+    try {
+        Instance.SetThink(fn);
+    } catch (e) {
+        if (!String(e).includes("already registered")) throw e;
+    }
+    thinkSetTo = fn;
+}
+
 
 // ---- Push strength ----
 // Prop mass at which the prop moves at half the player's push speed.
@@ -72,6 +121,19 @@ const MIN_INTO_SPEED = 20;
 // bullet, and are left to the engine.
 const MAX_EXTERNAL_SPEED = 400;
 
+// ---- CS:GO push (v11) ----
+// true = pushes follow CS:GO's player physics box (see the v11 notes at the top). false = v10's pushes (the
+// REF_MASS / MIN_PUSH_SPEED / SMOOTH_PUSH / DETECT_BLOCKED / SLOW_PLAYER / ROT_GAIN settings only apply then).
+const CSGO_PUSH = true;
+// The player box's top speed into anything it touches while pushing (CBasePlayer: SetPushSpeedLimit(50)).
+const PUSH_SPEED_LIMIT = 50;
+// The player's wish speed: 250 runs (knife); CS:GO walks at 0.52 of it and crouches at 0.34.
+const RUN_SPEED = 250;
+const WALK_SPEED_MOD = 0.52;
+const DUCK_SPEED_MOD = 0.34;
+// Spin safety cap, radians per second (CS:GO has none; only guards against a bad ROT_K2 guess).
+const MAX_PUSH_SPIN = 20;
+
 // ---- func_physbox masses (v8) ----
 // CS2 doesn't expose a physbox's mass to scripts, so it is listed here by entity name.
 //   mass   - kg, compared against REF_MASS (85 = one player)
@@ -82,11 +144,12 @@ const MAX_EXTERNAL_SPEED = 400;
 //            point_script gets RunScriptInput arm_<name> (send it at the same time as the plate's
 //            EnableMotion); it is disarmed again on round start. Use "input" if the plate tilts while
 //            it is still motion-disabled.
-// mg_hellz mg4 disks: 1024x1024x8 plates resting on an 8x8 pin, massScale 0.2 in CS:GO. Source 1
-// capped a brush's physics mass at 50000, times 0.2 = 10000 (estimate: tune with WEIGHT_GAIN).
+// mg_hellz mg4 disks: 1024x1024x8 plates resting on an 8x8 pin, massScale 0.2 in CS:GO. vbsp gives a brush with a hollow
+// surfaceprop (plain "metal" is 0.1 in sheet metal) surface area x thickness x density, not volume x density: ~9400 kg for a
+// metal 1024x1024x8 box, times 0.2 = ~1900 kg (the converter works it out from the brush since its shell-mass fix).
 // Not needed for maps converted by vmap_asset_slop_import.py (the names carry this); use it for hand-made
 // maps or to override a converted plate. Example:
-//   mg4_disk_t: { mass: 10000, size: [1024, 1024, 8], weight: true, push: false, arm: "auto" },
+//   mg4_disk_t: { mass: 1885, size: [1024, 1024, 8], weight: true, push: false, arm: "auto" },
 const PHYSBOX_MASS = {};
 const PHYSBOX_CLASSES = ["func_physbox", "func_physbox_multiplayer"];
 
@@ -94,9 +157,17 @@ const PHYSBOX_CLASSES = ["func_physbox", "func_physbox_multiplayer"];
 const WEIGHT_ON = true;
 // World gravity in units/s^2 (sv_gravity).
 const GRAVITY = 800;
-// Multiplier on the player's weight. 1 = one REF_MASS player at full gravity. Raise if plates tip too
-// slowly compared with CS:GO, lower if too fast.
+// Multiplier on the player's weight. 1 = one REF_MASS player at full gravity (CS:GO: the player box is 85 kg).
 const WEIGHT_GAIN = 1;
+// CS:GO's rules for how hard the player box presses (see the v10 notes at the top). false = 1 x weight always (v9).
+const CSGO_WEIGHT_RULES = true;
+// Weight multiplier while moving on a plate whose top is within FLAT_NORMAL_Z of level, and on a steeper one.
+const WALK_WEIGHT = 2;
+const WALK_WEIGHT_TILTED = 0;
+// vphysics treats a contact as floor (skipped by the push limit) when its normal z is at least 0.99 (about 8.1 degrees).
+const FLAT_NORMAL_Z = 0.99;
+// One impulse of REF_MASS x fall speed when a player lands on a plate.
+const LANDING_IMPULSE = true;
 // Also push the plate straight down (on a pin or in water the engine turns this into tilt / sinking).
 const WEIGHT_LINEAR = true;
 // Tilt speed cap in radians per second (the engine still adds its own gravity tilt on top).
@@ -189,7 +260,7 @@ const HULL_DUCK = { mins: { x: -16, y: -16, z: 4 }, maxs: { x: 16, y: 16, z: 54 
 //   vx,vy = remembered approach velocity, px,py = push direction (into the prop),
 //   t = last time contact was confirmed, prop = the prop being pushed
 const state = new Map();
-// Per-prop push memory: name -> { lastSet, lastTime, blockedUntil, pushers }
+// Per-prop push memory: prop entity -> { lastSet, lastTime, blockedUntil, pushers }
 const propState = new Map();
 let lastTime = 0;
 
@@ -235,6 +306,47 @@ function massOf(ent, cls, name) {
     return massFromName(name);
 }
 
+// The same entity? The API has no entity index, and the same entity can come back as a different object, so entities sharing a
+// name are told apart by position.
+function sameEnt(a, b) {
+    if (a === b) return true;
+    if (!a || !b || !a.IsValid() || !b.IsValid() || a.GetClassName() !== b.GetClassName() || a.GetEntityName() !== b.GetEntityName()) return false;
+    const p = a.GetAbsOrigin(), q = b.GetAbsOrigin();
+    return Math.abs(p.x - q.x) + Math.abs(p.y - q.y) + Math.abs(p.z - q.z) < 0.01;
+}
+// The key a map already uses for this entity (or the entity itself).
+function entKey(map, ent) {
+    if (map.has(ent)) return ent;
+    for (const k of map.keys()) if (sameEnt(k, ent)) return k;
+    return ent;
+}
+
+// What a player stands on, like CS:GO's ground check (the player's box resting on it, not jumping up): the engine's ground
+// entity, or, if that is the world or nothing (CS2 may not report physics objects as ground), a box trace down from the feet.
+const FEET = { mins: { x: -16, y: -16, z: 0 }, maxs: { x: 16, y: 16, z: 2 } };
+function standingOn(pawn) {
+    const g = pawn.GetGroundEntity();
+    if (g && g.IsValid() && !g.IsWorld()) return g;
+    if (pawn.GetAbsVelocity().z > 140) return undefined; // jumping up off it
+    const o = pawn.GetAbsOrigin();
+    const tr = Instance.TraceBox({
+        mins: FEET.mins,
+        maxs: FEET.maxs,
+        start: { x: o.x, y: o.y, z: o.z + 2 },
+        end: { x: o.x, y: o.y, z: o.z - GROUND_TRACE },
+        ignoreEntity: pawn,
+        ignorePlayers: true,
+    });
+    const e = tr.didHit && !tr.startedInSolid ? tr.hitEntity : undefined;
+    return e && e.IsValid() && !e.IsWorld() ? e : undefined;
+}
+// once per player per tick: slot -> entity stood on (or undefined)
+let stand = new Map();
+function standOf(slot, pawn) {
+    if (!stand.has(slot)) stand.set(slot, standingOn(pawn));
+    return stand.get(slot);
+}
+
 // True only if the prop is being pushed into a wall / static object, not into
 // another movable prop and not into open space.
 function isWallAhead(prop, px, py, pawn) {
@@ -257,7 +369,6 @@ function isWallAhead(prop, px, py, pawn) {
 // props with a unique name are never renamed. The mass still parses. Already-renamed props are
 // skipped, and state for props that no longer exist is dropped.
 function renameNewProps() {
-    const live = new Set();
     const seen = new Set();
     for (const cls of ["prop_physics", "prop_physics_override"]) {
         for (const ent of Instance.FindEntitiesByClass(cls)) {
@@ -273,11 +384,10 @@ function renameNewProps() {
                     seen.add(name);
                 }
             }
-            live.add(name);
         }
     }
-    for (const key of propState.keys()) {
-        if (!live.has(key)) propState.delete(key);
+    for (const key of [...propState.keys()]) {
+        if (!key.IsValid()) propState.delete(key);
     }
 }
 
@@ -306,14 +416,17 @@ Instance.OnRoundStart(() => {
     renameNewProps();
 });
 
-Instance.OnActivate(() => {
+function start() {
     Instance.Msg("push_mass: script activated");
     registerArmInputs();
     renameNewProps();
     lastTime = Instance.GetGameTime();
-    Instance.SetThink(tick);
+    setThinkOnce(tick);
     Instance.SetNextThink(lastTime);
-});
+}
+Instance.OnActivate(start);
+// In tools mode, saving the .js reloads the script and clears every callback (the think too); OnActivate doesn't fire again.
+if (typeof Instance.OnScriptReload === "function") Instance.OnScriptReload({ after: start });
 
 Instance.OnBeforePlayerDamage((event) => {
     const inf = event.inflictor;
@@ -331,7 +444,7 @@ Instance.OnBeforePlayerDamage((event) => {
     if (!valid || massOf(inf, inf.GetClassName(), name) === undefined) return;
 
     if (NO_SELF_PUSH_DAMAGE) {
-        const ps = propState.get(name);
+        const ps = propState.get(entKey(propState, inf));
         const ctrl = event.player ? event.player.GetPlayerController() : undefined;
         const pushedAt = ps && ctrl && ps.pushers ? ps.pushers.get(ctrl.GetPlayerSlot()) : undefined;
         if (pushedAt !== undefined && Instance.GetGameTime() - pushedAt < SELF_PUSH_WINDOW) {
@@ -367,51 +480,72 @@ function axes(a) {
 }
 const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
 let nextWeightMsg = 0;
-const weightState = new Map(); // plate name -> { w: angular velocity last written, t: time }
-let readScale = 1;
 
-// Every player standing on a weight plate gives it an impulse of (player weight * dt) straight down at
-// their feet: the plate's velocity changes by J / mass and its spin by I^-1 (r x J), r measured from the
-// plate's origin (its centre in a converted map). A centred player only presses down; an off-centre one tilts it.
+// CS:GO's controller only runs while the player's wish velocity isn't zero, i.e. while movement keys push them.
+function keysHeld(pawn) {
+    if (typeof pawn.IsInputPressed !== "function") return false;
+    const f = (pawn.IsInputPressed(CSInputs.FORWARD) ? 1 : 0) - (pawn.IsInputPressed(CSInputs.BACK) ? 1 : 0);
+    const s = (pawn.IsInputPressed(CSInputs.RIGHT) ? 1 : 0) - (pawn.IsInputPressed(CSInputs.LEFT) ? 1 : 0);
+    return f !== 0 || s !== 0;
+}
+// How level the face a player stands on is: the largest |z| of the plate's own axes (1 = level, 0.99 = ~8.1 degrees).
+function faceUpZ(ent) {
+    const ax = axes(ent.GetAbsAngles());
+    return Math.max(Math.abs(ax[0].z), Math.abs(ax[1].z), Math.abs(ax[2].z));
+}
+// slot -> { on, vz, o, t } from the previous tick, to spot landings
+const airState = new Map();
+
+// Every player standing on a weight plate gives it an impulse of (player weight * dt * k) straight down at
+// their feet (k from CS:GO's rules, plus a landing impulse): the plate's velocity changes by J / mass and its spin by
+// I^-1 (r x J), r measured from the plate's origin (its centre in a converted map). A centred player only presses down;
+// an off-centre one tilts it.
 function applyWeight(dt, now) {
-    const plates = new Map(); // name -> { ent, info, feet: [] }
+    const plates = new Map(); // plate entity -> { ent, name, info, feet: [] } (same-named plates kept apart)
     for (let slot = 0; slot < 64; slot++) {
         const controller = Instance.GetPlayerController(slot);
         const pawn = controller ? controller.GetPlayerPawn() : undefined;
         if (!pawn || !pawn.IsAlive()) continue;
-        // What the player stands on: the engine's ground entity, or (if that is not a physbox, e.g. CS2 does not report physics
-        // objects as ground) a short trace down from the feet.
-        let ground = pawn.GetGroundEntity();
-        if (!ground || !ground.IsValid() || !isPhysbox(ground.GetClassName())) {
-            const vz = pawn.GetAbsVelocity().z;
-            if (Math.abs(vz) > 60) continue; // jumping / falling
-            const o = pawn.GetAbsOrigin();
-            const tr = Instance.TraceLine({ start: { x: o.x, y: o.y, z: o.z + 4 }, end: { x: o.x, y: o.y, z: o.z - GROUND_TRACE }, ignoreEntity: pawn, ignorePlayers: true });
-            ground = tr.didHit && !tr.startedInSolid ? tr.hitEntity : undefined;
-            if (!ground || !ground.IsValid() || ground.IsWorld() || !isPhysbox(ground.GetClassName())) continue;
-        }
+        const ground = standOf(slot, pawn);
+        const o = pawn.GetAbsOrigin();
+        const prev = airState.get(slot);
+        airState.set(slot, { on: !!ground, vz: pawn.GetAbsVelocity().z, o, t: now });
+        if (!ground || !isPhysbox(ground.GetClassName())) continue;
         const name = ground.GetEntityName().replace(/&\d+$/, "");
         const info = physboxInfo(name);
         if (!info || !info.weight) continue;
         if (info.arm === "input" && !armed.has(name)) continue;
-        let p = plates.get(name);
-        if (!p) plates.set(name, (p = { ent: ground, info, feet: [] }));
-        p.feet.push(pawn.GetAbsOrigin());
+        const key = entKey(plates, ground);
+        let p = plates.get(key);
+        if (!p) plates.set(key, (p = { ent: key, name, info, feet: [] }));
+        let k = 1, land = 0;
+        if (CSGO_WEIGHT_RULES) {
+            const moving = keysHeld(pawn);
+            const flat = faceUpZ(ground) >= FLAT_NORMAL_Z;
+            k = !moving ? 1 : flat ? WALK_WEIGHT : WALK_WEIGHT_TILTED;
+            // Landed this tick: in the air last tick, falling, and not a teleport or respawn.
+            const fresh = prev && now - prev.t < 0.1 && Math.hypot(o.x - prev.o.x, o.y - prev.o.y, o.z - prev.o.z) < 64 + -prev.vz * dt * 2;
+            if (LANDING_IMPULSE && fresh && !prev.on && prev.vz < 0 && !(moving && !flat)) land = -prev.vz;
+        }
+        p.feet.push({ o, k, land });
     }
 
     const debug = DEBUG_WEIGHT && now >= nextWeightMsg;
     if (debug) nextWeightMsg = now + 0.5;
 
-    for (const [name, { ent, info, feet }] of plates) {
+    for (const { ent, name, info, feet } of plates.values()) {
         const m = info.mass;
-        const j = REF_MASS * WEIGHT_GAIN * GRAVITY * dt; // impulse per player, kg*u/s, pointing down
         const c = ent.GetAbsOrigin();
-        // Torque impulse (r x J) with J = (0, 0, -j): (-ry*j, rx*j, 0)
+        // Torque impulse (r x J) with J = (0, 0, -j): (-ry*j, rx*j, 0). j = this player's impulse, kg*u/s, pointing down.
         const tq = { x: 0, y: 0, z: 0 };
+        let jSum = 0;
         for (const f of feet) {
-            tq.x += -(f.y - c.y) * j;
-            tq.y += (f.x - c.x) * j;
+            const j = REF_MASS * WEIGHT_GAIN * (GRAVITY * dt * f.k + f.land);
+            tq.x += -(f.o.y - c.y) * j;
+            tq.y += (f.o.x - c.x) * j;
+            jSum += j;
         }
+        if (jSum <= 0) continue; // only players moving on a tilted plate: CS:GO's box doesn't press it
         // Spin change = I^-1 * torque, with I diagonal in the plate's own axes.
         const ax = axes(ent.GetAbsAngles());
         let I;
@@ -428,21 +562,10 @@ function applyWeight(dt, now) {
             dw.y += ax[k].y * wl;
             dw.z += ax[k].z * wl;
         }
+        // Read and written in the same units (ANGVEL_DEGREES). DEBUG_WEIGHT prints both, to check them in game.
         const unit = ANGVEL_DEGREES ? 180 / Math.PI : 1;
         const w0 = ent.GetAbsAngularVelocity();
-        // The spin read back is compared with what was written last tick: if the engine reports it in other units than it takes
-        // (degrees vs radians, a factor of ~57), the read is rescaled, otherwise every tick would throw most of the tilt away.
-        const st = weightState.get(name);
-        if (st && now - st.t < 0.1 && readScale === 1) {
-            const wr = Math.hypot(st.w.x, st.w.y), rr = Math.hypot(w0.x, w0.y);
-            if (wr > 1e-3 && rr > 0) {
-                const q = rr / wr;
-                if (q > 30 && q < 120) readScale = 1 / 57.2958;
-                else if (q > 1 / 120 && q < 1 / 30) readScale = 57.2958;
-                if (readScale !== 1) Instance.Msg(`push_mass: angular velocity is read back in other units than it is set; rescaling reads by ${readScale.toFixed(4)}`);
-            }
-        }
-        let w = { x: (w0.x * readScale) / unit + dw.x, y: (w0.y * readScale) / unit + dw.y, z: (w0.z * readScale) / unit + dw.z };
+        let w = { x: w0.x / unit + dw.x, y: w0.y / unit + dw.y, z: w0.z / unit + dw.z };
         // Cap the tilt (spin about horizontal axes) without touching any yaw spin.
         const tilt = Math.hypot(w.x, w.y);
         if (tilt > MAX_TILT_SPIN) {
@@ -450,27 +573,94 @@ function applyWeight(dt, now) {
             w.y *= MAX_TILT_SPIN / tilt;
         }
         const angularVelocity = { x: w.x * unit, y: w.y * unit, z: w.z * unit };
-        weightState.set(name, { w: angularVelocity, t: now });
         if (WEIGHT_LINEAR) {
             const v = ent.GetAbsVelocity();
-            const velocity = { x: v.x, y: v.y, z: v.z - (j * feet.length) / m };
+            const velocity = { x: v.x, y: v.y, z: v.z - jSum / m };
             ent.Teleport({ velocity, angularVelocity });
         } else {
             ent.Teleport({ angularVelocity });
         }
         if (debug) {
             Instance.Msg(
-                `weight ${name}: players ${feet.length}, spin read ${w0.x.toFixed(2)} ${w0.y.toFixed(2)} ${w0.z.toFixed(2)}, ` +
+                `weight ${name}: players ${feet.length} (x${feet.map((f) => f.k).join(" x")}${feet.some((f) => f.land) ? ", landing " + feet.filter((f) => f.land).map((f) => f.land.toFixed(0)).join(" ") + " u/s" : ""}), spin read ${w0.x.toFixed(2)} ${w0.y.toFixed(2)} ${w0.z.toFixed(2)}, ` +
                     `added ${(dw.x * unit).toFixed(3)} ${(dw.y * unit).toFixed(3)} ${(dw.z * unit).toFixed(3)} (${ANGVEL_DEGREES ? "deg" : "rad"}/s)`,
             );
         }
     }
 }
 
+// CS:GO's wish direction from the movement keys and view yaw (undefined when no key moves the player)
+function wishDir(pawn) {
+    if (typeof pawn.IsInputPressed !== "function") return undefined;
+    const f = (pawn.IsInputPressed(CSInputs.FORWARD) ? 1 : 0) - (pawn.IsInputPressed(CSInputs.BACK) ? 1 : 0);
+    const s = (pawn.IsInputPressed(CSInputs.RIGHT) ? 1 : 0) - (pawn.IsInputPressed(CSInputs.LEFT) ? 1 : 0);
+    if (!f && !s) return undefined;
+    const y = (pawn.GetEyeAngles().yaw * Math.PI) / 180;
+    const x = Math.cos(y) * f + Math.sin(y) * s, yy = Math.sin(y) * f - Math.cos(y) * s, l = Math.hypot(x, yy);
+    return { x: x / l, y: yy / l };
+}
+
+// One prop, every player's box pushing it this tick (CS:GO model, see the v11 notes). Each box is an 85 kg body with
+// no spin of its own moving at u into the prop, and each contact is inelastic: it pushes (never pulls) until the box and
+// the contact point move together. One box: J = (u - v_contact) / (1/85 + 1/m + lever^2 / I), applied at the player's
+// side offset (lever) so it also spins the prop about its yaw. Several boxes are solved together (a few passes over the
+// contacts, as a physics solver does), so players pushing from opposite sides squeeze the prop instead of the last one
+// winning. u = the player's speed for a new touch (any mass), or for a held push min(50, (wish speed into the prop -
+// contact speed) / 2), and 0 for props over PUSH_MASS_LIMIT.
+function pushCsgo(g, now) {
+    const { prop, name, mass } = g;
+    const pr = prop.GetAbsVelocity();
+    if (Math.hypot(pr.x, pr.y) > MAX_EXTERNAL_SPEED) return;
+    const po = prop.GetAbsOrigin();
+    const info = isPhysbox(prop.GetClassName()) ? physboxInfo(name) : undefined;
+    const k2 = info && info.size ? (info.size[0] * info.size[0] + info.size[1] * info.size[1]) / 12 : ROT_K2;
+    const I = mass * k2;
+    const unit = ANGVEL_DEGREES ? 180 / Math.PI : 1;
+    const w0 = prop.GetAbsAngularVelocity();
+    let vx = pr.x, vy = pr.y, wz = w0.z / unit;
+    const contacts = g.list.map((e) => {
+        const lever = ROTATE_PROPS ? (e.o.x - po.x) * e.py - (e.o.y - po.y) * e.px : 0;
+        const vc = vx * e.px + vy * e.py + wz * lever;
+        const u = e.impact ? e.approach : PUSH_MASS_LIMIT > 0 && mass > PUSH_MASS_LIMIT ? 0 : Math.min(PUSH_SPEED_LIMIT, 0.5 * (e.wishN - vc));
+        return { e, lever, u, J: 0, k: 1 / (1 / REF_MASS + 1 / mass + (ROTATE_PROPS ? (lever * lever) / I : 0)) };
+    });
+    for (let pass = 0; pass < (contacts.length > 1 ? 50 : 1); pass++) {
+        for (const c of contacts) {
+            const vc = vx * c.e.px + vy * c.e.py + wz * c.lever;
+            const J = Math.max(0, c.J + (c.u - c.J / REF_MASS - vc) * c.k); // box speed after its own impulse: u - J/85
+            const dj = J - c.J;
+            c.J = J;
+            vx += (dj / mass) * c.e.px;
+            vy += (dj / mass) * c.e.py;
+            wz += (dj * c.lever) / I;
+        }
+    }
+    if (!ps(prop).pushers) ps(prop).pushers = new Map();
+    for (const e of g.list) ps(prop).pushers.set(e.slot, now); // every player currently pushing this prop
+    const used = contacts.filter((c) => c.J > 1e-6);
+    if (!used.length) return;
+    wz = Math.max(-MAX_PUSH_SPIN, Math.min(MAX_PUSH_SPIN, wz));
+    const velocity = { x: vx, y: vy, z: pr.z };
+    prop.Teleport(ROTATE_PROPS ? { velocity, angularVelocity: { x: w0.x, y: w0.y, z: wz * unit } } : { velocity });
+    if (DEBUG) {
+        Instance.Msg(
+            `${name} (mass ${mass}): ${used.map((c) => `${c.e.impact ? "impact" : "push"} ${c.u.toFixed(0)} u/s`).join(", ")}; speed ${Math.hypot(pr.x, pr.y).toFixed(0)} -> ${Math.hypot(vx, vy).toFixed(0)} u/s, spin ${(w0.z / unit).toFixed(2)} -> ${wz.toFixed(2)} rad/s`,
+        );
+    }
+}
+// The prop's bookkeeping (who pushed it, for the damage filter)
+function ps(prop) {
+    const pk = entKey(propState, prop);
+    let s = propState.get(pk);
+    if (!s) propState.set(pk, (s = { lastSet: 0, lastTime: -1, blockedUntil: 0 }));
+    return s;
+}
+
 function tick() {
     const now = Instance.GetGameTime();
     const dt = Math.min(Math.max(now - lastTime, 0.001), 0.1);
     lastTime = now;
+    stand = new Map();
 
     if (now >= nextScan) {
         nextScan = now + SCAN_INTERVAL;
@@ -495,6 +685,7 @@ function tick() {
 
         // Which way to look for a prop, and how far.
         let tx, ty, dist;
+        const wd = CSGO_PUSH ? wishDir(pawn) : undefined;
         if (st) {
             tx = st.px;
             ty = st.py;
@@ -502,6 +693,11 @@ function tick() {
         } else if (pSpeed >= MIN_INTO_SPEED) {
             tx = pv.x / pSpeed;
             ty = pv.y / pSpeed;
+            dist = CONTACT_DIST;
+        } else if (wd) {
+            // CS:GO: the box pushes from the keys, even when the player is already stopped against the prop
+            tx = wd.x;
+            ty = wd.y;
             dist = CONTACT_DIST;
         } else {
             continue;
@@ -528,7 +724,14 @@ function tick() {
             inside = true;
         } else if (!tr.didHit || tr.startedInSolid || !tr.hitEntity) {
             // Brief loss of contact: keep the remembered push for a moment.
+            if (st) st.touched = false; // CS:GO: the next touch is a new impact
             if (st && now - st.t < CONTACT_GRACE) continue;
+            state.delete(slot);
+            continue;
+        }
+
+        // CS:GO's player doesn't push what it stands on (CBasePlayer::Touch ignores its ground entity).
+        if (sameEnt(standOf(slot, pawn), prop)) {
             state.delete(slot);
             continue;
         }
@@ -540,7 +743,7 @@ function tick() {
             state.delete(slot);
             continue;
         }
-        if (PUSH_MASS_LIMIT > 0 && mass > PUSH_MASS_LIMIT) {
+        if (!CSGO_PUSH && PUSH_MASS_LIMIT > 0 && mass > PUSH_MASS_LIMIT) {
             // Too heavy for the player to move; leave it to the engine.
             state.delete(slot);
             continue;
@@ -564,6 +767,22 @@ function tick() {
         const px = -nx;
         const py = -ny;
 
+        if (CSGO_PUSH) {
+            // A new touch is an impact at the player's speed; a continued one is the box pressing from the keys.
+            const touchedBefore = !!(st && st.touched && sameEnt(st.prop, prop));
+            const ducked = typeof pawn.IsDucked === "function" ? pawn.IsDucked() : pawn.IsCrouched();
+            const W = wd ? RUN_SPEED * (ducked ? DUCK_SPEED_MOD : pawn.IsInputPressed(CSInputs.WALK) ? WALK_SPEED_MOD : 1) : 0;
+            const wishN = wd ? W * (wd.x * px + wd.y * py) : 0;
+            const approach = pv.x * px + pv.y * py;
+            state.set(slot, { vx: pv.x, vy: pv.y, px, py, t: now, prop, touched: true });
+            if (touchedBefore ? wishN <= 0 : approach <= 0) continue; // touching, not pushing into it
+            const gk = entKey(groups, prop);
+            let g = groups.get(gk);
+            if (!g) groups.set(gk, (g = { prop: gk, name, mass, list: [] }));
+            g.list.push({ slot, pawn, pv, o, px, py, into: approach, impact: !touchedBefore, approach, wishN });
+            continue;
+        }
+
         // Approach velocity: use the live one if it is pushing harder than the
         // remembered one (player moving freely into the prop), otherwise keep
         // the remembered one (player blocked by the prop, or sliding along it).
@@ -580,15 +799,20 @@ function tick() {
         }
         state.set(slot, { vx, vy, px, py, t: now, prop });
 
-        let g = groups.get(name);
+        const gk = entKey(groups, prop); // per entity: same-named physboxes are separate pushes
+        let g = groups.get(gk);
         if (!g) {
-            g = { prop, name, mass, list: [] };
-            groups.set(name, g);
+            g = { prop: gk, name, mass, list: [] };
+            groups.set(gk, g);
         }
         g.list.push({ slot, pawn, pv, o, px, py, into });
     }
 
     for (const g of groups.values()) {
+        if (CSGO_PUSH) {
+            pushCsgo(g, now);
+            continue;
+        }
         const { prop, name, mass } = g;
         // The strongest pusher sets the direction. Pushers within ~60 degrees of it add their weight; players pushing
         // from other directions do not help (opposite ones would only cancel).
@@ -601,10 +825,11 @@ function tick() {
         const pr = prop.GetAbsVelocity();
         if (Math.hypot(pr.x, pr.y) > MAX_EXTERNAL_SPEED) continue;
 
-        let ps = propState.get(name);
+        const pk = entKey(propState, prop);
+        let ps = propState.get(pk);
         if (!ps) {
             ps = { lastSet: 0, lastTime: -1, blockedUntil: 0 };
-            propState.set(name, ps);
+            propState.set(pk, ps);
         }
         // Pinned against something: let the engine settle instead of pumping speed in.
         if (DETECT_BLOCKED && now < ps.blockedUntil) continue;
@@ -687,5 +912,26 @@ function tick() {
         }
     }
 
+    capSpeeds();
     Instance.SetNextThink(Instance.GetGameTime());
 }
+
+// CS:GO's physics never let an object go faster than 2000 u/s (vphysics' default performance settings, maxVelocity 2000). CS2 has
+// no such cap: mg_mario_party's mushroom, driven by a 1000 u/s/s thruster (Ignore Mass) for 1-3 s at a time, went well past it and
+// left the spawn room through the walls (a 20-unit cube moving 30+ units a tick). Every physics prop / physbox is held to 2000.
+const CSGO_MAX_SPEED = 2000;
+const CAP_CLASSES = ["prop_physics", "prop_physics_override", "prop_physics_multiplayer", "func_physbox", "func_physbox_multiplayer"];
+function capSpeeds() {
+    for (const cls of CAP_CLASSES) {
+        for (const ent of Instance.FindEntitiesByClass(cls)) {
+            if (!ent.IsValid()) continue;
+            const v = ent.GetAbsVelocity();
+            const sp = Math.hypot(v.x, v.y, v.z);
+            if (sp <= CSGO_MAX_SPEED) continue;
+            const f = CSGO_MAX_SPEED / sp;
+            ent.Teleport({ velocity: { x: v.x * f, y: v.y * f, z: v.z * f } });
+            if (DEBUG) Instance.Msg(`push_mass: ${ent.GetEntityName() || cls} capped ${sp.toFixed(0)} -> ${CSGO_MAX_SPEED} u/s`);
+        }
+    }
+}
+

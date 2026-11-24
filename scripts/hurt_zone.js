@@ -75,6 +75,19 @@
 // Written against Valve's point_script.d.ts and checked with a stand-in engine only. Not run in CS2.
 
 import { Instance, CSDamageTypes, CSDamageFlags } from "cs_script/point_script";
+// CS2 now refuses a second SetThink ("Callback \"Think\" already registered"): the think is set once (a script reload re-runs
+// this file, so it is set again then)
+let thinkSetTo = null;
+function setThinkOnce(fn) {
+    if (thinkSetTo === fn) return;
+    try {
+        Instance.SetThink(fn);
+    } catch (e) {
+        if (!String(e).includes("already registered")) throw e;
+    }
+    thinkSetTo = fn;
+}
+
 
 // ---- Settings ----
 const PREFIX = "hurt_";
@@ -576,9 +589,18 @@ function registerInputs() {
     }
 }
 
+// The zone that fired the input. The caller can arrive as a different object for the same entity (the API has no entity
+// index), so it is matched by class, name and position.
+function isCaller(ent, caller) {
+    if (!ent || !caller) return false;
+    if (ent === caller) return true;
+    if (!ent.IsValid() || !caller.IsValid() || ent.GetClassName() !== caller.GetClassName() || ent.GetEntityName() !== caller.GetEntityName()) return false;
+    const a = ent.GetAbsOrigin(), b = caller.GetAbsOrigin();
+    return Math.abs(a.x - b.x) + Math.abs(a.y - b.y) + Math.abs(a.z - b.z) < 0.01;
+}
 for (const action of ["On", "Off", "Toggle", "Stop"]) {
     Instance.OnScriptInput(`Hurt_${action}`, (d) => {
-        for (const z of zones) if (z.ent === d.caller) ACTIONS[action](z);
+        for (const z of zones) if (isCaller(z.ent, d.caller)) ACTIONS[action](z);
     });
 }
 
@@ -798,7 +820,16 @@ function srcTick(z, pawns, scale) {
 
 let lastNow = 0;
 let tickDt = 0; // seconds since the last think (laser zones deal damage per second)
+let thinkErrors = 0;
 function think() {
+    Instance.SetNextThink(Instance.GetGameTime()); // first, so an error can't stop the loop
+    try {
+        think2();
+    } catch (e) {
+        if (thinkErrors++ < 5) Instance.Msg(`hurt_zone: error: ${(e && e.stack) || e}`);
+    }
+}
+function think2() {
     now = Instance.GetGameTime();
     const dt = Math.min(Math.max(now - lastNow, 0), 0.25);
     tickDt = dt;
@@ -816,16 +847,18 @@ function think() {
         }
         for (const z of zones) if (z.kind !== "fire") tickZone(z, pawns);
     }
-    Instance.SetNextThink(now);
 }
 
-Instance.OnActivate(() => {
+function start() {
     now = Instance.GetGameTime();
     lastNow = now;
     scan();
-    Instance.SetThink(think);
+    setThinkOnce(think);
     Instance.SetNextThink(now);
-});
+}
+Instance.OnActivate(start);
+// In tools mode, saving the .js reloads the script and clears every callback (the think too); OnActivate doesn't fire again.
+if (typeof Instance.OnScriptReload === "function") Instance.OnScriptReload({ after: start });
 // map entities are new objects every round: hook and parse them again
 Instance.OnRoundStart(() => {
     now = Instance.GetGameTime();
